@@ -1,0 +1,63 @@
+# =============================================================================
+# Docker Compose — Dokploy deployment (Hostinger VPS)
+#
+# Dokploy uses Traefik as its reverse proxy. The labels below tell Traefik how
+# to route traffic to this service and issue a Let's Encrypt TLS certificate.
+#
+# In Dokploy, set these environment variables for the app:
+#   DOMAIN      -> your domain, e.g. api.example.com
+#   SECRET_KEY, DATABASE_URL (Neon), DEBUG=False, and any optional keys.
+#
+# Postgres is EXTERNAL (Neon) via DATABASE_URL — there is no db service here.
+# =============================================================================
+
+services:
+  web:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Traefik reaches the container internally; no host port publishing needed.
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    labels:
+      - "traefik.enable=true"
+      # HTTP router -> redirect to HTTPS
+      - "traefik.http.routers.backend-http.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.backend-http.entrypoints=web"
+      - "traefik.http.routers.backend-http.middlewares=redirect-to-https@docker"
+      # HTTPS router + automatic Let's Encrypt certificate
+      - "traefik.http.routers.backend.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+      # Forward to gunicorn on :8000
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+      # HTTPS redirect middleware
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+  # --- Optional: uncomment only if you use Redis cache and/or Celery tasks -----
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis_data:/data
+  #
+  # worker:
+  #   build: .
+  #   env_file:
+  #     - .env
+  #   restart: unless-stopped
+  #   command: celery -A config worker -l info --concurrency=4
+  #   depends_on:
+  #     - redis
+  #   # then set REDIS_URL=redis://redis:6379/0 in your env
+
+# volumes:
+#   redis_data:

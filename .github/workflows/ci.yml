@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SECRET_KEY: ci-secret-key
+      DEBUG: "True"
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: System checks
+        run: python manage.py check
+      - name: Migrations are complete
+        run: python manage.py makemigrations --check --dry-run
+      - name: Migrate (Postgres)
+        run: python manage.py migrate
+      - name: "🔒 Tenant isolation gate — if this fails, DO NOT SHIP"
+        run: |
+          python manage.py test apps.store.tests.test_tenant_isolation --verbosity 2
+          python manage.py test apps.store.tests.test_tenant_contract --verbosity 2
+          python manage.py test apps.store.tests.test_pharmacy_required --verbosity 2
+      - name: "🔒 Isolation greps — the retired shared catalog must stay retired"
+        run: |
+          # No read path may reach through the legacy Product->CatalogItem link.
+          ! grep -rn "catalog_item__image" apps/ --include="*.py" --exclude-dir=migrations
+          # Nothing outside admin/ops may create or query the shared CatalogItem table.
+          ! grep -rn "CatalogItem.objects" apps/store/importers.py apps/store/serializers.py apps/store/views.py apps/store/cloning.py
+      - name: Run tests
+        run: python manage.py test

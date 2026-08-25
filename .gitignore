@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+/media/
+/staticfiles/
+
+# Local data (price list used by `import_meds`, run locally against Neon)
+/data/*.xlsx
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local test database created by scripts/verify.sh (never Neon)
+.verify-test.sqlite3
+
+# ── added when preparing the GitHub push ────────────────────────────────────
+# Anything that looks like a real environment file, whatever it is called.
+*.env
+.env.local
+.envrc
+# Local Postgres dumps / fixtures pulled while debugging
+*.dump
+*.sql.gz

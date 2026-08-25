@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Core (always needed)
+# ---------------------------------------------------------------------------
+Django==5.2
+djangorestframework==3.16.0
+djangorestframework-simplejwt==5.4.0
+drf-spectacular==0.28.0
+django-filter==25.1
+django-cors-headers==4.7.0
+django-jazzmin==3.0.1
+django-simple-history==3.7.0
+dj-database-url==2.3.0
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+whitenoise==6.6.0
+gunicorn==21.2.0
+Pillow==11.2.1
+openpyxl==3.1.5
+qrcode==8.2
+
+# ---------------------------------------------------------------------------
+# Optional integrations
+# Installed by default so the code paths exist, but each only ACTIVATES when
+# its env vars are set (see .env.example). Safe to remove any you never use.
+# ---------------------------------------------------------------------------
+sentry-sdk==2.20.0            # activates when SENTRY_DSN is set
+django-redis==5.4.0           # activates when REDIS_URL is set
+redis==5.2.1                  #   (client for django-redis / celery)
+celery==5.4.0                 # activates when a broker/REDIS_URL is set
+django-storages==1.14.4       # activates when B2_* keys are set
+boto3==1.35.99                #   (S3/B2 backend for django-storages)
+
+# ---------------------------------------------------------------------------
+# Clerk — customer auth for the ordering app. Staff still sign in with Django
+# users; these two only ever touch the /api/v1/me/ + webhook paths.
+# ---------------------------------------------------------------------------
+clerk-backend-api==7.0.0      # activates when CLERK_SECRET_KEY is set
+svix==1.45.1                  #   verifies the user.created/updated webhooks
+
+# ---------------------------------------------------------------------------
+# Dev conveniences (optional)
+# ---------------------------------------------------------------------------
+django-extensions==3.2.3

@@ -1,0 +1,28 @@
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Secrets & local artifacts (never bake these into the image)
+.env
+.env.*
+!.env.example
+db.sqlite3
+media/
+staticfiles/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.log

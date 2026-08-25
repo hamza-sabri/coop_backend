@@ -1,0 +1,86 @@
+#!/usr/bin/env sh
+# =============================================================================
+# django-backend — a tiny CLI to start & build Django + DRF backends fast,
+# from the django-backend-template. Install once, use in any project.
+#
+#   django-backend new my-api      # scaffold a new project into ./my-api
+#   django-backend update          # update this CLI to the latest version
+#   django-backend version | help
+# =============================================================================
+set -e
+
+VERSION="0.1.0"
+REPO="hamza-sabri/django-backend-template"
+TARBALL="${DBACKEND_TARBALL:-https://github.com/$REPO/archive/refs/heads/main.tar.gz}"
+RAW="https://raw.githubusercontent.com/$REPO/main"
+
+usage() {
+  cat <<EOF
+django-backend $VERSION — scaffold Django + DRF backends, fast.
+
+Usage:
+  django-backend new [name]      Create a new project in ./name (default: my-backend)
+  django-backend update          Update this CLI to the latest version
+  django-backend version         Print the version
+  django-backend help            Show this help
+
+After creating a project:
+  cd <name>
+  python -m venv .venv && source .venv/bin/activate
+  pip install -r requirements.txt
+  python manage.py init          # wizard: writes .env, sets up the database
+  python manage.py migrate && python manage.py runserver
+
+Inside a project you also get these commands:
+  python manage.py newapp <app>                 create a new app
+  python manage.py setup_model <app> <Model>    generate a full CRUD API
+EOF
+}
+
+cmd_new() {
+  NAME="${1:-my-backend}"
+  [ -e "$NAME" ] && { echo "✗ ./$NAME already exists. Pick another name."; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo "✗ curl is required."; exit 1; }
+  command -v tar  >/dev/null 2>&1 || { echo "✗ tar is required."; exit 1; }
+
+  echo "▶ Creating ./$NAME from $REPO ..."
+  tmp="$(mktemp -d)"
+  curl -fsSL "$TARBALL" | tar -xz -C "$tmp"
+  # Move the single extracted top-level directory into ./NAME (name-agnostic).
+  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)"
+  mv "$src" "$NAME"
+  rm -rf "$tmp"
+
+  ( cd "$NAME" && rm -rf .git && git init -q >/dev/null 2>&1 || true )
+
+  cat <<EOF
+
+✓ Created ./$NAME
+
+Build it out — either way works:
+
+  ▸ Ask your AI agent (it reads CLAUDE.md and runs the commands for you):
+      "Set up this backend: add models for <your domain> — with migrations,
+       REST APIs and admin."
+
+  ▸ Or do it yourself:
+      cd $NAME
+      python -m venv .venv && source .venv/bin/activate
+      pip install -r requirements.txt
+      python manage.py init        # writes .env (+ a local Postgres if you skip -d)
+      python manage.py migrate && python manage.py runserver
+EOF
+}
+
+cmd_update() {
+  echo "▶ Updating django-backend ..."
+  curl -fsSL "$RAW/install.sh" | sh
+}
+
+case "${1:-help}" in
+  new)                shift; cmd_new "$@" ;;
+  update|upgrade)     cmd_update ;;
+  version|-v|--version) echo "django-backend $VERSION" ;;
+  help|-h|--help|"")  usage ;;
+  *) echo "Unknown command: $1"; echo; usage; exit 1 ;;
+esac
