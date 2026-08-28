@@ -1337,3 +1337,228 @@ class BeanLedger(models.Model):
 
     def __str__(self):
         return f"{self.delta:+d} · {self.reason}"
+
+
+# ---------------------------------------------------------------------------
+# Customer-placed orders
+#
+# A Sale is a COMPLETED till transaction. An Order is the thing that exists
+# before that: the customer taps "طلب جديد" in the PWA, the counter sees it,
+# makes it, and hands it over. Modelling it as a status on Sale was tempting
+# and wrong — a Sale is immutable history that stock and money already moved
+# for, while an Order is a short-lived workflow that can be cancelled before
+# anything is owed. Keeping them separate means an abandoned order never has
+# to be un-rung.
+#
+# The Sale is created when the order is COLLECTED, and linked back here, so
+# reports keep counting money in exactly one place.
+# ---------------------------------------------------------------------------
+class Order(TimeStampedModel):
+    """An order placed by a signed-in customer from the shop app."""
+
+    class Status(models.TextChoices):
+        PLACED = "placed", "بانتظار التأكيد"
+        ACCEPTED = "accepted", "تم القبول"
+        PREPARING = "preparing", "قيد التحضير"
+        READY = "ready", "جاهز للاستلام"
+        COLLECTED = "collected", "تم الاستلام"
+        CANCELLED = "cancelled", "ملغى"
+
+    #: Which statuses may follow which. Enforced in one place so a stray API
+    #: call cannot walk an order backwards from collected to preparing, and so
+    #: the customer app can grey out impossible buttons from the same table.
+    TRANSITIONS: dict[str, tuple[str, ...]] = {
+        Status.PLACED: (Status.ACCEPTED, Status.CANCELLED),
+        Status.ACCEPTED: (Status.PREPARING, Status.CANCELLED),
+        Status.PREPARING: (Status.READY, Status.CANCELLED),
+        Status.READY: (Status.COLLECTED, Status.CANCELLED),
+        Status.COLLECTED: (),
+        Status.CANCELLED: (),
+    }
+
+    store = models.ForeignKey(
+        Store, related_name="orders", on_delete=models.CASCADE
+    )
+    #: Required, unlike Sale.customer: a walk-in has no app to order from.
+    customer = models.ForeignKey(
+        Customer, related_name="orders", on_delete=models.CASCADE
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.PLACED, db_index=True,
+    )
+    #: Frozen from the line items when the order is placed. Prices can change
+    #: on the menu afterwards; what the customer agreed to must not.
+    total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), editable=False
+    )
+    note = models.TextField(blank=True)
+    #: Set when the order is collected and rung up. One row of money, not two.
+    sale = models.ForeignKey(
+        "store.Sale", related_name="orders", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    cancelled_reason = models.CharField(max_length=255, blank=True)
+    #: Same idempotency contract as Sale: a phone on a bad connection retries
+    #: the POST, and must not end up with two identical orders.
+    client_uuid = models.CharField(
+        max_length=64, null=True, blank=True, default=None, db_index=True
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        verbose_name = "Order"
+        verbose_name_plural = "Orders"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "client_uuid"],
+                name="uniq_order_client_uuid",
+            ),
+        ]
+        indexes = [
+            # The counter's queue: this store's open orders, oldest first.
+            models.Index(fields=["store", "status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"#{self.pk} · {self.get_status_display()}"
+
+    def can_move_to(self, status: str) -> bool:
+        return status in self.TRANSITIONS.get(self.status, ())
+
+
+class OrderItem(models.Model):
+    """One line of an order, with the name and price SNAPSHOTTED.
+
+    Same reasoning as SaleItem: a product renamed or repriced next month must
+    not rewrite what someone ordered last week, and a deleted product must not
+    empty out old orders.
+    """
+
+    order = models.ForeignKey(
+        Order, related_name="items", on_delete=models.CASCADE
+    )
+    product = models.ForeignKey(
+        Product, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    variant = models.ForeignKey(
+        ProductVariant, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    name = models.CharField(max_length=255)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    quantity = models.DecimalField(
+        max_digits=12, decimal_places=3, default=Decimal("1")
+    )
+    #: "بدون سكر", "تيك أواي" — per line, as asked for at the counter.
+    note = models.CharField(max_length=255, blank=True)
+
+    objects = TenantManager("order__store_id")
+    unguarded = models.Manager()
+
+    class Meta:
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+
+    def __str__(self):
+        return f"{self.name} ×{self.quantity}"
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+class Notification(TimeStampedModel):
+    """One thing worth telling a customer about.
+
+    This row is the RECORD; push is only a delivery attempt on top of it. That
+    ordering matters: push fails constantly — permission never granted, an iOS
+    device that never installed the PWA, an expired subscription, a phone that
+    was off — and a notification the customer can still find in the app when
+    they next open it is worth far more than one that evaporated.
+    """
+
+    class Kind(models.TextChoices):
+        ORDER_PLACED = "order_placed", "تم إرسال الطلب"
+        ORDER_ACCEPTED = "order_accepted", "تم قبول الطلب"
+        ORDER_PREPARING = "order_preparing", "قيد التحضير"
+        ORDER_READY = "order_ready", "جاهز للاستلام"
+        ORDER_COLLECTED = "order_collected", "تم الاستلام"
+        ORDER_CANCELLED = "order_cancelled", "أُلغي الطلب"
+        POINTS_EARNED = "points_earned", "نقاط جديدة"
+        POINTS_SPENT = "points_spent", "استبدال نقاط"
+        POINTS_EXPIRING = "points_expiring", "نقاط على وشك الانتهاء"
+        REWARD_UNLOCKED = "reward_unlocked", "مكافأة متاحة"
+
+    store = models.ForeignKey(
+        Store, related_name="notifications", on_delete=models.CASCADE
+    )
+    customer = models.ForeignKey(
+        Customer, related_name="notifications", on_delete=models.CASCADE
+    )
+    kind = models.CharField(max_length=32, choices=Kind.choices, db_index=True)
+    title = models.CharField(max_length=140)
+    body = models.CharField(max_length=400, blank=True)
+    #: Anything the UI needs to deep-link or render: {"order_id": 12,
+    #: "delta": +15}. Deliberately loose — a new notification kind should not
+    #: need a migration.
+    data = models.JSONField(default=dict, blank=True)
+    read_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    #: When the push was handed to the browser vendor. NULL = never attempted
+    #: or no subscription; it says nothing about whether a human saw it.
+    pushed_at = models.DateTimeField(null=True, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        indexes = [
+            # The bell: this customer's unread count, and their feed.
+            models.Index(fields=["store", "customer", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} → {self.customer_id}"
+
+
+class PushSubscription(TimeStampedModel):
+    """One browser's Web Push endpoint for one customer.
+
+    One customer can have several — phone, tablet, the shop's iPad — so this
+    is keyed on the endpoint, not the customer. Endpoints die silently; a 404
+    or 410 from the push service means "gone", and the row is deleted rather
+    than retried forever.
+    """
+
+    store = models.ForeignKey(
+        Store, related_name="push_subscriptions", on_delete=models.CASCADE
+    )
+    customer = models.ForeignKey(
+        Customer, related_name="push_subscriptions", on_delete=models.CASCADE
+    )
+    #: The URL the push service gave us. Unique across the table — the same
+    #: browser re-subscribing must update, not duplicate.
+    endpoint = models.TextField(unique=True)
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    user_agent = models.CharField(max_length=255, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+
+    def __str__(self):
+        return f"{self.customer_id} · {self.endpoint[:40]}…"
