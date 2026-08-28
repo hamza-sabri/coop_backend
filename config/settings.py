@@ -37,13 +37,36 @@ def env_list(name: str, default: str = "") -> list[str]:
 # ---------------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-CHANGE-ME-in-production")
 DEBUG = env_bool("DEBUG", True)
+# A fallback secret is a convenience in development and a vulnerability in
+# production: session cookies, password-reset tokens and signed URLs are all
+# forgeable by anyone who has read this file — and this file is on GitHub.
+# Refuse to boot rather than run on a key the whole world knows.
+if not DEBUG and SECRET_KEY.startswith("django-insecure"):
+    raise ImproperlyConfigured(
+        "SECRET_KEY is unset with DEBUG=False. Set a real SECRET_KEY in the "
+        "environment before deploying."
+    )
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "*" if DEBUG else "")
+# The container healthcheck curls http://localhost:8000/healthz/ from inside the
+# container. Django validates Host before routing, so without loopback here that
+# probe 400s, the task never turns healthy, and the proxy serves 502 for a
+# process that is actually running fine. Traefik routes by Host rule, so these
+# two names are not reachable from outside.
+if ALLOWED_HOSTS and "*" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS += [h for h in ("localhost", "127.0.0.1") if h not in ALLOWED_HOSTS]
 
 # Behind a proxy/load balancer (Railway, Render, Fly, etc.)
 if env_bool("USE_X_FORWARDED_PROTO", not DEBUG):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+
+# Jazzmin renders the admin's related-object popups ("Add another Store", the
+# green + beside a FK) inside a SAME-ORIGIN iframe. Django's default for
+# X_FRAME_OPTIONS is DENY, which blocks even same-origin framing — the popup
+# comes up empty with "refused to connect" and no server-side error to find.
+# SAMEORIGIN still blocks every other site from framing the admin.
+X_FRAME_OPTIONS = "SAMEORIGIN"
 
 # ---------------------------------------------------------------------------
 # Applications
