@@ -29,6 +29,7 @@ from apps.core.permissions import (
     StoreResolved,
 )
 
+from apps.accounts.clerk import ClerkAuthentication
 from . import models, scan_tracking, serializers
 
 
@@ -3938,6 +3939,101 @@ class PurchaseOrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         invalidate_med_stats_cache(self.store_id)
         invalidate_pos_catalog_cache(self.store_id)
         return Response(self.get_serializer(order).data)
+
+
+
+class ShopMeView(APIView):
+    """The signed-in customer's own standing, for the PWA home screen.
+
+    Until this existed the app rendered `const START_BEANS = 248` — a literal
+    — next to three more literals for cups, free drinks and streak. It looked
+    finished and told every customer the same lie. Everything here is read
+    from the rows that already exist: LoyaltyProfile for the cached balance
+    and tier, BeanLedger for what actually happened, Sale for the count.
+
+    Authenticated by Clerk, not by the staff JWT: the customer app has no
+    staff session and must never be given one.
+    """
+
+    authentication_classes = [ClerkAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    #: How many beans a free drink costs. A constant for now — when the shop
+    #: wants to tune it, it moves onto Store and this becomes a lookup.
+    REWARD_COST = 260
+
+    def get(self, request):
+        clerk_id = getattr(request, "clerk_id", None)
+        if not clerk_id:
+            return Response({"detail": "جلسة غير صالحة"}, status=401)
+
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return Response({"detail": "المتجر غير متاح"}, status=503)
+
+        customer = (
+            models.Customer.objects.for_pharmacy(store.pk)
+            .filter(clerk_id=clerk_id)
+            .select_related("loyalty")
+            .first()
+        )
+        if customer is None:
+            # Signed in with Clerk but never synced. The app calls
+            # /clerk/sync/ on launch, so this is a first-run race, not an
+            # error worth showing anyone.
+            return Response({"synced": False, "beans": 0}, status=200)
+
+        profile = getattr(customer, "loyalty", None)
+        beans = getattr(profile, "beans", 0) or 0
+
+        year_start = timezone.now().replace(
+            month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        cups_this_year = (
+            models.Sale.objects.for_pharmacy(store.pk)
+            .filter(customer=customer, is_return=False, created_at__gte=year_start)
+            .count()
+        )
+        free_cups = (
+            models.BeanLedger.objects.for_pharmacy(store.pk)
+            .filter(customer=customer, reason=models.BeanLedger.Reason.REDEEM)
+            .count()
+        )
+
+        recent = list(
+            models.BeanLedger.objects.for_pharmacy(store.pk)
+            .filter(customer=customer)
+            .order_by("-created_at")[:20]
+            .values("delta", "reason", "note", "balance_after", "created_at")
+        )
+
+        return Response({
+            "synced": True,
+            "name": customer.name,
+            "beans": beans,
+            "tier": getattr(profile, "tier", "single"),
+            "multiplier": str(getattr(profile, "multiplier", 1)),
+            "streak_weeks": getattr(profile, "streak_weeks", 0) or 0,
+            "visits_this_month": getattr(profile, "visits_this_month", 0) or 0,
+            "cups_this_year": cups_this_year,
+            "free_cups": free_cups,
+            "reward_cost": self.REWARD_COST,
+            # What the home screen's "باقي N نقطة" line needs, computed here so
+            # the phone never has to know the rule.
+            "to_next_reward": max(0, self.REWARD_COST - (beans % self.REWARD_COST)),
+            "activity": [
+                {
+                    "delta": r["delta"],
+                    "reason": r["reason"],
+                    "note": r["note"],
+                    "balance_after": r["balance_after"],
+                    "at": r["created_at"].isoformat(),
+                }
+                for r in recent
+            ],
+        })
 
 
 # <scaffold:viewsets>

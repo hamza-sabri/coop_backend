@@ -36,6 +36,10 @@ urlpatterns = router.urls + [
     path("public/stats/", views.PublicStatsView.as_view(), name="public-stats"),
     # The customer app reads its menu here — see PublicMenuView.
     path("public/menu/", views.PublicMenuView.as_view(), name="public-menu"),
+    # The signed-in customer's own points, tier and history. Clerk-authed —
+    # this is the shop app's equivalent of /auth/me/, and the reason the home
+    # screen no longer ships hardcoded numbers.
+    path("shop/me/", views.ShopMeView.as_view(), name="shop-me"),
     path("public/branding/", views.PublicBrandingView.as_view(), name="public-branding"),
     path("public/branding/icon/", views.PublicBrandingIconView.as_view(), name="public-branding-icon"),
     path("import/hesabate/products/", views.HesabateImportProductsView.as_view(), name="import-products"),
