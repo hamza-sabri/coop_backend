@@ -4176,7 +4176,15 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     # Without it `self.store_id` does not exist and every list 500s with an
     # AttributeError — which is exactly what the queue was doing.
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [filters.OrderingFilter, filters.SearchFilter]
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        filters.OrderingFilter,
+        filters.SearchFilter,
+    ]
+    # ?customer= is what a customer profile needs; ?status= is what the queue
+    # needs. Without a filter backend both were silently ignored and every
+    # caller got the whole store's orders.
+    filterset_fields = ["status", "customer", "fulfilment"]
     # Searching a reverse relation multiplies rows; distinct() in the queryset
     # keeps one card per order.
     search_fields = ["customer__name", "items__name"]
