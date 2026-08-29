@@ -329,6 +329,12 @@ class Product(TimeStampedModel):
     expiry_alert_days = models.PositiveSmallIntegerField(null=True, blank=True)
 
     notes = models.TextField(blank=True)
+    #: Is this on the menu today? ProductVariant has always had this flag;
+    #: Product never did, so a café that ran out of oat milk at nine in the
+    #: morning had no way to say so and took orders for it all day.
+    #: Availability is a menu concept, not a stock count — a café does not
+    #: track units, it knows what it can make right now.
+    is_active = models.BooleanField(default=True, db_index=True)
     image = models.URLField(max_length=1000, blank=True)
     # An optional product VIDEO the shopper can watch on the price page — a
     # direct file URL (mp4/webm) or a YouTube/Vimeo link. Display-only; stored
@@ -1399,6 +1405,25 @@ class Order(TimeStampedModel):
         on_delete=models.SET_NULL,
     )
     cancelled_reason = models.CharField(max_length=255, blank=True)
+
+    class Fulfilment(models.TextChoices):
+        PICKUP = "pickup", "استلام"
+        DINE_IN = "dinein", "على الطاولة"
+
+    #: How the customer wants it. The app has always asked this question and
+    #: never sent the answer, so the counter could not tell a takeaway cup from
+    #: one going to a table. Delivery is deliberately absent: it needs
+    #: addresses, a fee and a courier state, and كوب has none of those.
+    fulfilment = models.CharField(
+        max_length=12, choices=Fulfilment.choices,
+        default=Fulfilment.PICKUP, db_index=True,
+    )
+    #: Only meaningful for dine-in. Free text — tables are named "٣" or "برّا".
+    table_number = models.CharField(max_length=32, blank=True)
+
+    #: Beans redeemed against this order. The ledger row is the truth; this is
+    #: the copy that lets a receipt be reprinted without recomputing history.
+    beans_spent = models.PositiveIntegerField(default=0)
     #: Same idempotency contract as Sale: a phone on a bad connection retries
     #: the POST, and must not end up with two identical orders.
     client_uuid = models.CharField(

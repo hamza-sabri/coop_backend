@@ -1435,7 +1435,13 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "id", "product", "variant", "name",
             "unit_price", "quantity", "note", "line_total",
         ]
-        read_only_fields = ["id", "line_total"]
+        # `name` and `unit_price` are SNAPSHOTS the server takes, not values the
+        # client supplies. They used to be writable, which meant the phone
+        # decided what a drink cost: a modified client could order a ₪26 juice
+        # for ₪1, and an honest client with a stale cache could undercharge by
+        # accident. The client still sends its price — see OrderSerializer —
+        # but only so drift can be detected and reported.
+        read_only_fields = ["id", "line_total", "name", "unit_price"]
 
     def get_line_total(self, obj) -> str:
         return str((obj.unit_price or Decimal("0")) * (obj.quantity or Decimal("0")))
@@ -1455,6 +1461,7 @@ class OrderSerializer(serializers.ModelSerializer):
         fields = [
             "id", "status", "status_label", "next_statuses",
             "customer", "customer_name", "total", "note",
+            "fulfilment", "table_number", "beans_spent",
             "cancelled_reason", "client_uuid", "items",
             "created_at", "updated_at",
         ]
@@ -1467,7 +1474,7 @@ class OrderSerializer(serializers.ModelSerializer):
             # {"customer": ["This field is required."]} — the app had no id to
             # send and must never be trusted with one.
             "id", "status_label", "next_statuses", "total", "customer",
-            "customer_name", "created_at", "updated_at",
+            "customer_name", "created_at", "updated_at", "beans_spent",
         ]
 
     def get_next_statuses(self, obj) -> list:
@@ -1477,12 +1484,47 @@ class OrderSerializer(serializers.ModelSerializer):
         items = validated.pop("items", [])
         if not items:
             raise serializers.ValidationError({"items": "الطلب فارغ."})
+
+        store = validated["store"]
         order = models.Order.unguarded.create(**validated)
         total = Decimal("0")
+
         for row in items:
             row.pop("id", None)
+            product = row.get("product")
+            variant = row.get("variant")
+
+            # PRICE AND NAME COME FROM THE MENU, not from the request.
+            if variant is not None:
+                if variant.product.store_id != store.pk:
+                    raise serializers.ValidationError({"items": "صنف غير متاح."})
+                if not variant.is_active:
+                    raise serializers.ValidationError(
+                        {"items": f"{variant.label} مش متوفر حالياً."})
+                unit = variant.price or (variant.product.price or Decimal("0"))
+                name = f"{variant.product.name} — {variant.label}"
+                product = variant.product
+                row["product"] = product
+            elif product is not None:
+                if product.store_id != store.pk:
+                    raise serializers.ValidationError({"items": "صنف غير متاح."})
+                unit = product.price or Decimal("0")
+                name = product.name
+            else:
+                # No id at all — the bundled offline menu. Nothing to price
+                # against, so refuse rather than trust the phone.
+                raise serializers.ValidationError(
+                    {"items": "الطلب قديم — افتح المنيو من جديد."})
+
+            if product is not None and not product.is_active:
+                raise serializers.ValidationError(
+                    {"items": f"{product.name} مش متوفر حالياً."})
+
+            row["unit_price"] = unit
+            row["name"] = name
             line = models.OrderItem.unguarded.create(order=order, **row)
-            total += (line.unit_price or Decimal("0")) * (line.quantity or Decimal("0"))
+            total += unit * (line.quantity or Decimal("0"))
+
         # Frozen: the menu may move tomorrow, this number may not.
         models.Order.unguarded.filter(pk=order.pk).update(total=total)
         order.total = total

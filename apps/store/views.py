@@ -1451,8 +1451,10 @@ class PublicMenuView(APIView):
             rows = (
                 models.Product.objects.for_pharmacy(store_id)
                 .select_related("category")
-                # Product has no is_active flag — availability is a menu
-                # concept that does not exist on the model yet.
+                # Availability now exists. A drink switched off in المنيو
+                # disappears from the customer app within the cache window
+                # instead of being orderable all day.
+                .filter(is_active=True)
                 .order_by("category__name", "name")
                 .values(
                     "id", "name", "price", "image", "notes",
@@ -3968,6 +3970,9 @@ class ShopMeView(APIView):
     #: How many beans a free drink costs. A constant for now — when the shop
     #: wants to tune it, it moves onto Store and this becomes a lookup.
     REWARD_COST = 260
+    #: Beans per shekel, used both when earning and when redeeming. One
+    #: number, one place: the app used to divide by 3.33 in the browser.
+    POINTS_PER_ILS = 3.33
 
     def get(self, request):
         clerk_id = getattr(request, "clerk_id", None)
@@ -4103,13 +4108,58 @@ class ShopOrdersView(APIView):
             if existing is not None:
                 return Response(serializers.OrderSerializer(existing).data, status=200)
 
+        fulfilment = (request.data.get("fulfilment") or "pickup").strip()
+        if fulfilment not in dict(models.Order.Fulfilment.choices):
+            fulfilment = models.Order.Fulfilment.PICKUP
+        table = (request.data.get("table_number") or "").strip()[:32]
+        if fulfilment != models.Order.Fulfilment.DINE_IN:
+            table = ""
+
         ser = serializers.OrderSerializer(data={
             "items": request.data.get("items") or [],
             "note": request.data.get("note") or "",
+            "fulfilment": fulfilment,
+            "table_number": table,
             "client_uuid": client_uuid,
         })
         ser.is_valid(raise_exception=True)
         order = ser.save(store=store, customer=customer)
+
+        # ── paying with points ───────────────────────────────────────────
+        # Checked HERE, after the total is known and inside the same
+        # transaction, because a balance read on the phone thirty seconds ago
+        # is not a balance. The ledger row is the redemption; Order.beans_spent
+        # is a copy for reprinting a receipt.
+        want = request.data.get("beans_spent")
+        if want:
+            try:
+                want = max(0, int(want))
+            except (TypeError, ValueError):
+                want = 0
+        if want:
+            profile = getattr(customer, "loyalty", None)
+            have = getattr(profile, "beans", 0) or 0
+            # Never let a redemption exceed the balance OR the order — points
+            # cannot buy more than the drink costs, and cannot go negative.
+            rate = ShopMeView.POINTS_PER_ILS
+            max_by_total = int(order.total * Decimal(str(rate)))
+            spend = min(want, have, max_by_total)
+            if spend > 0:
+                models.BeanLedger.objects.create(
+                    store=store,
+                    customer=customer,
+                    delta=-spend,
+                    reason=models.BeanLedger.Reason.REDEEM,
+                    balance_after=have - spend,
+                    note=f"طلب #{order.pk}",
+                    idempotency_key=f"order-redeem:{order.pk}",
+                )
+                if profile is not None:
+                    profile.beans = have - spend
+                    profile.save(update_fields=["beans"])
+                order.beans_spent = spend
+                order.save(update_fields=["beans_spent"])
+
         return Response(serializers.OrderSerializer(order).data, status=201)
 
 
