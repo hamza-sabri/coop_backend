@@ -4113,7 +4113,7 @@ class ShopOrdersView(APIView):
         return Response(serializers.OrderSerializer(order).data, status=201)
 
 
-class OrderViewSet(viewsets.ModelViewSet):
+class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     """Staff side: the counter's queue.
 
     Read and advance only — an order is created by a customer, never by the
@@ -4122,8 +4122,13 @@ class OrderViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = serializers.OrderSerializer
-    permission_classes = [permissions.IsAuthenticated, StoreResolved]
+    # StoreScopedMixin supplies `store_id` and appends the StoreResolved guard.
+    # Without it `self.store_id` does not exist and every list 500s with an
+    # AttributeError — which is exactly what the queue was doing.
+    permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.OrderingFilter, filters.SearchFilter]
+    # Searching a reverse relation multiplies rows; distinct() in the queryset
+    # keeps one card per order.
     search_fields = ["customer__name", "items__name"]
     ordering = ["-created_at"]
     http_method_names = ["get", "patch", "head", "options"]
@@ -4133,6 +4138,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             models.Order.objects.for_pharmacy(self.store_id)
             .select_related("customer")
             .prefetch_related("items")
+            .distinct()
         )
 
     @action(detail=True, methods=["post"])
