@@ -14,6 +14,7 @@ router.register(r"sales", views.SaleViewSet, basename="sale")
 # Owner-managed staff (accounts.User), tenant-scoped by hand in the viewset.
 router.register(r"staff", views.StaffViewSet, basename="staff")
 router.register(r"purchase-orders", views.PurchaseOrderViewSet, basename="purchase-order")
+router.register(r"orders", views.OrderViewSet, basename="order")
 # <scaffold:routes>
 urlpatterns = router.urls + [
     # Svix delivers Clerk signups here. Verified against the raw body.
@@ -40,6 +41,8 @@ urlpatterns = router.urls + [
     # this is the shop app's equivalent of /auth/me/, and the reason the home
     # screen no longer ships hardcoded numbers.
     path("shop/me/", views.ShopMeView.as_view(), name="shop-me"),
+    # The customer places orders here and reads their own history back.
+    path("shop/orders/", views.ShopOrdersView.as_view(), name="shop-orders"),
     path("public/branding/", views.PublicBrandingView.as_view(), name="public-branding"),
     path("public/branding/icon/", views.PublicBrandingIconView.as_view(), name="public-branding-icon"),
     path("import/hesabate/products/", views.HesabateImportProductsView.as_view(), name="import-products"),

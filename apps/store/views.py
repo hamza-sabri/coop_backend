@@ -4036,4 +4036,110 @@ class ShopMeView(APIView):
         })
 
 
+
+class ShopOrdersView(APIView):
+    """The customer's own orders — place one, and see the ones before it.
+
+    Clerk-authenticated, and scoped to the caller's own customer row: there is
+    no order id in the URL and no way to ask for anybody else's. The store slug
+    comes from settings, never from the request, for the same reason.
+    """
+
+    authentication_classes = [ClerkAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _resolve(self, request):
+        clerk_id = getattr(request, "clerk_id", None)
+        if not clerk_id:
+            return None, None
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return None, None
+        customer = (
+            models.Customer.objects.for_pharmacy(store.pk)
+            .filter(clerk_id=clerk_id)
+            .first()
+        )
+        return store, customer
+
+    def get(self, request):
+        store, customer = self._resolve(request)
+        if customer is None:
+            return Response({"results": []})
+        qs = (
+            models.Order.objects.for_pharmacy(store.pk)
+            .filter(customer=customer)
+            .prefetch_related("items")
+            .order_by("-created_at")[:50]
+        )
+        return Response({"results": serializers.OrderSerializer(qs, many=True).data})
+
+    @transaction.atomic
+    def post(self, request):
+        store, customer = self._resolve(request)
+        if customer is None:
+            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+
+        # Idempotency: a phone on a bad connection retries, and must not order
+        # twice. Same contract the offline POS uses for sales.
+        client_uuid = (request.data.get("client_uuid") or "").strip() or None
+        if client_uuid:
+            existing = (
+                models.Order.objects.for_pharmacy(store.pk)
+                .filter(client_uuid=client_uuid)
+                .prefetch_related("items")
+                .first()
+            )
+            if existing is not None:
+                return Response(serializers.OrderSerializer(existing).data, status=200)
+
+        ser = serializers.OrderSerializer(data={
+            "items": request.data.get("items") or [],
+            "note": request.data.get("note") or "",
+            "client_uuid": client_uuid,
+        })
+        ser.is_valid(raise_exception=True)
+        order = ser.save(store=store, customer=customer)
+        return Response(serializers.OrderSerializer(order).data, status=201)
+
+
+class OrderViewSet(viewsets.ModelViewSet):
+    """Staff side: the counter's queue.
+
+    Read and advance only — an order is created by a customer, never by the
+    till, so there is no create here. The status move goes through the model's
+    transition table so nothing can walk an order backwards.
+    """
+
+    serializer_class = serializers.OrderSerializer
+    permission_classes = [permissions.IsAuthenticated, StoreResolved]
+    filter_backends = [filters.OrderingFilter, filters.SearchFilter]
+    search_fields = ["customer__name", "items__name"]
+    ordering = ["-created_at"]
+    http_method_names = ["get", "patch", "head", "options"]
+
+    def get_queryset(self):
+        return (
+            models.Order.objects.for_pharmacy(self.store_id)
+            .select_related("customer")
+            .prefetch_related("items")
+        )
+
+    @action(detail=True, methods=["post"])
+    def advance(self, request, pk=None):
+        """POST {status} — move an order one legal step."""
+        order = self.get_object()
+        target = (request.data.get("status") or "").strip()
+        if not order.can_move_to(target):
+            return Response(
+                {"detail": f"لا يمكن الانتقال من {order.status} إلى {target}"},
+                status=400,
+            )
+        order.status = target
+        order.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(order).data)
+
+
 # <scaffold:viewsets>

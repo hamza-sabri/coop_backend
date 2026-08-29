@@ -1411,4 +1411,75 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         return instance
 
 
+
+class OrderItemSerializer(serializers.ModelSerializer):
+    """One line of a customer order.
+
+    `name` and `unit_price` are SNAPSHOTS taken when the order is placed, not
+    joins onto the product. A price change or a rename next week must not
+    rewrite what somebody ordered today, and deleting a product must not empty
+    an old order.
+    """
+
+    product = serializers.PrimaryKeyRelatedField(
+        queryset=models.Product.objects.unscoped(), required=False, allow_null=True
+    )
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=models.ProductVariant.objects.unscoped(), required=False, allow_null=True
+    )
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.OrderItem
+        fields = [
+            "id", "product", "variant", "name",
+            "unit_price", "quantity", "note", "line_total",
+        ]
+        read_only_fields = ["id", "line_total"]
+
+    def get_line_total(self, obj) -> str:
+        return str((obj.unit_price or Decimal("0")) * (obj.quantity or Decimal("0")))
+
+
+class OrderSerializer(serializers.ModelSerializer):
+    items = OrderItemSerializer(many=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    #: Which statuses this order may move to next, straight from the model's
+    #: transition table — so the POS can grey out impossible buttons instead of
+    #: discovering them by getting a 400.
+    next_statuses = serializers.SerializerMethodField()
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+
+    class Meta:
+        model = models.Order
+        fields = [
+            "id", "status", "status_label", "next_statuses",
+            "customer", "customer_name", "total", "note",
+            "cancelled_reason", "client_uuid", "items",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "status_label", "next_statuses", "total",
+            "customer_name", "created_at", "updated_at",
+        ]
+
+    def get_next_statuses(self, obj) -> list:
+        return list(models.Order.TRANSITIONS.get(obj.status, ()))
+
+    def create(self, validated):
+        items = validated.pop("items", [])
+        if not items:
+            raise serializers.ValidationError({"items": "الطلب فارغ."})
+        order = models.Order.unguarded.create(**validated)
+        total = Decimal("0")
+        for row in items:
+            row.pop("id", None)
+            line = models.OrderItem.unguarded.create(order=order, **row)
+            total += (line.unit_price or Decimal("0")) * (line.quantity or Decimal("0"))
+        # Frozen: the menu may move tomorrow, this number may not.
+        models.Order.unguarded.filter(pk=order.pk).update(total=total)
+        order.total = total
+        return order
+
+
 # <scaffold:serializers>
