@@ -1046,13 +1046,19 @@ class PublicPriceCheckView(APIView):
         grouped = {}
         for v in models.ProductVariant.objects.for_pharmacy(pid).filter(
             product_id__in=list(price_by_med.keys()), is_active=True
-        ).values("product_id", "label", "price", "image", "attributes"):
+        ).values("id", "product_id", "label", "price", "image", "attributes"):
             own = v["price"] or Decimal("0")
             eff = own if own > 0 else (price_by_med.get(v["product_id"]) or Decimal("0"))
             if eff <= 0:
                 continue
             grouped.setdefault(v["product_id"], []).append(
                 {
+                    # The id was missing here, and its absence was not
+                    # cosmetic: the app compared `picked?.id === v.id`, both
+                    # undefined, so EVERY option matched and every chip drew
+                    # itself as selected. It also meant an order could never
+                    # record WHICH option was chosen.
+                    "id": v["id"],
                     "label": v["label"],
                     "price": str(eff),
                     "image": resolve_stored_url(v["image"] or ""),

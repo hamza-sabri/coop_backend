@@ -1459,7 +1459,14 @@ class OrderSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "status_label", "next_statuses", "total",
+            # `customer` is READ-ONLY, and that is a security property, not a
+            # convenience: it is resolved from the Clerk token in the view, so
+            # a client cannot place an order in somebody else's name by
+            # putting their id in the body. It was writable-and-required,
+            # which meant every genuine order 400'd with
+            # {"customer": ["This field is required."]} — the app had no id to
+            # send and must never be trusted with one.
+            "id", "status_label", "next_statuses", "total", "customer",
             "customer_name", "created_at", "updated_at",
         ]
 
