@@ -26,7 +26,7 @@ from django.http import HttpResponse, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import authentication, exceptions
+from rest_framework import authentication, exceptions, permissions
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,30 @@ class ClerkAuthentication(authentication.BaseAuthentication):
         request.clerk_id = clerk_id
         request.clerk_claims = payload
         return None
+
+
+class IsClerkCustomer(permissions.BasePermission):
+    """Authenticated as a SHOP CUSTOMER — which is not a Django user.
+
+    ClerkAuthentication deliberately returns None: a customer has no
+    auth.User row, only a Customer row, and inventing a Django user for
+    every espresso drinker would put thousands of never-used accounts in the
+    admin. But DRF reads None as "this authenticator did not authenticate",
+    leaves request.user anonymous, and IsAuthenticated then rejects the
+    request — so every Clerk-authed DRF view 401'd no matter how valid the
+    token was. /shop/me/ returned nothing and /shop/orders/ refused to create
+    anything, silently, which looked exactly like the app not being wired up.
+
+    ClerkSyncView never hit this because it is a plain Django View that calls
+    the authenticator by hand.
+
+    So the permission checks what the authenticator actually sets.
+    """
+
+    message = "جلسة غير صالحة"
+
+    def has_permission(self, request, view) -> bool:
+        return bool(getattr(request, "clerk_id", None))
 
 
 def upsert_customer(store, data: dict):

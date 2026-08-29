@@ -29,7 +29,7 @@ from apps.core.permissions import (
     StoreResolved,
 )
 
-from apps.accounts.clerk import ClerkAuthentication
+from apps.accounts.clerk import ClerkAuthentication, IsClerkCustomer
 from . import models, scan_tracking, serializers
 
 
@@ -3956,7 +3956,8 @@ class ShopMeView(APIView):
     """
 
     authentication_classes = [ClerkAuthentication]
-    permission_classes = [permissions.IsAuthenticated]
+    #: NOT IsAuthenticated — a customer has no Django user. See IsClerkCustomer.
+    permission_classes = [IsClerkCustomer]
 
     #: How many beans a free drink costs. A constant for now — when the shop
     #: wants to tune it, it moves onto Store and this becomes a lookup.
@@ -4046,7 +4047,8 @@ class ShopOrdersView(APIView):
     """
 
     authentication_classes = [ClerkAuthentication]
-    permission_classes = [permissions.IsAuthenticated]
+    #: NOT IsAuthenticated — a customer has no Django user. See IsClerkCustomer.
+    permission_classes = [IsClerkCustomer]
 
     def _resolve(self, request):
         clerk_id = getattr(request, "clerk_id", None)
