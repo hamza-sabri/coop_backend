@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 from . import views
 from apps.accounts.clerk import ClerkSyncView, ClerkWebhookView
+from apps.accounts.firebase import FirebaseSyncView
 
 router = DefaultRouter()
 router.register(r"products", views.MedicationViewSet, basename="product")
@@ -21,6 +22,9 @@ urlpatterns = router.urls + [
     path("clerk/webhook/", ClerkWebhookView.as_view(), name="clerk-webhook"),
     # Called once on sign-in, so a customer exists without a webhook tunnel.
     path("clerk/sync/", ClerkSyncView.as_view(), name="clerk-sync"),
+    # Same contract as clerk/sync/, for the native app. Called once per
+    # sign-in so the Customer row exists before the first /shop/me/.
+    path("firebase/sync/", FirebaseSyncView.as_view(), name="firebase-sync"),
     path(
         "store/quick-groups/",
         views.QuickGroupsView.as_view(),
@@ -43,6 +47,21 @@ urlpatterns = router.urls + [
     path("shop/me/", views.ShopMeView.as_view(), name="shop-me"),
     # The customer places orders here and reads their own history back.
     path("shop/orders/", views.ShopOrdersView.as_view(), name="shop-orders"),
+    path(
+        "shop/orders/<int:pk>/cancel/",
+        views.ShopOrderCancelView.as_view(),
+        name="shop-order-cancel",
+    ),
+    # This phone can receive push. Re-called on every launch: FCM tokens rotate.
+    path("shop/devices/", views.ShopDeviceView.as_view(), name="shop-devices"),
+    # One-tap reorder of what they always get.
+    path("shop/usual/", views.ShopUsualView.as_view(), name="shop-usual"),
+    # The durable half of notifications — works when push does not.
+    path(
+        "shop/notifications/",
+        views.ShopNotificationsView.as_view(),
+        name="shop-notifications",
+    ),
     path("public/branding/", views.PublicBrandingView.as_view(), name="public-branding"),
     path("public/branding/icon/", views.PublicBrandingIconView.as_view(), name="public-branding-icon"),
     path("import/hesabate/products/", views.HesabateImportProductsView.as_view(), name="import-products"),

@@ -450,3 +450,23 @@ CLERK_WEBHOOK_SIGNING_SECRET = os.getenv("CLERK_WEBHOOK_SIGNING_SECRET", "")
 # this becomes a lookup on the request host.
 CLERK_STORE_SLUG = os.getenv("CLERK_STORE_SLUG", "koup")
 SIGNUP_BONUS_BEANS = int(os.getenv("SIGNUP_BONUS_BEANS", "5") or 5)
+
+# ---------------------------------------------------------------------------
+# Firebase — customer auth for the native app, and push for both platforms.
+#
+# Two independent halves, and it matters that they are independent:
+#
+#   FIREBASE_PROJECT_ID  is all that sign-in needs. ID tokens are verified
+#                        against Google's PUBLIC keys, so no credential is
+#                        involved and nothing secret has to reach this server
+#                        for a customer to log in.
+#
+#   FIREBASE_CREDENTIALS is the service-account JSON, and it is only needed to
+#                        SEND push. It is a real secret — it can mint tokens
+#                        for the whole project — so it lives in the
+#                        environment, never in the image or the repo. Absent,
+#                        notifications are still recorded and the app still
+#                        shows them; only the doorbell is missing.
+# ---------------------------------------------------------------------------
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "")

@@ -30,6 +30,12 @@ from apps.core.permissions import (
 )
 
 from apps.accounts.clerk import ClerkAuthentication, IsClerkCustomer
+from apps.accounts.firebase import (
+    FirebaseAuthentication,
+    IsAppCustomer,
+    identity_filter,
+)
+from apps.store import push as push_service
 from . import models, scan_tracking, serializers
 
 
@@ -3963,9 +3969,9 @@ class ShopMeView(APIView):
     staff session and must never be given one.
     """
 
-    authentication_classes = [ClerkAuthentication]
-    #: NOT IsAuthenticated — a customer has no Django user. See IsClerkCustomer.
-    permission_classes = [IsClerkCustomer]
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    #: NOT IsAuthenticated — a customer has no Django user. See IsAppCustomer.
+    permission_classes = [IsAppCustomer]
 
     #: How many beans a free drink costs. A constant for now — when the shop
     #: wants to tune it, it moves onto Store and this becomes a lookup.
@@ -3975,8 +3981,8 @@ class ShopMeView(APIView):
     POINTS_PER_ILS = 3.33
 
     def get(self, request):
-        clerk_id = getattr(request, "clerk_id", None)
-        if not clerk_id:
+        ident = identity_filter(request)
+        if not ident:
             return Response({"detail": "جلسة غير صالحة"}, status=401)
 
         store = models.Store.objects.filter(
@@ -3987,7 +3993,7 @@ class ShopMeView(APIView):
 
         customer = (
             models.Customer.objects.for_pharmacy(store.pk)
-            .filter(clerk_id=clerk_id)
+            .filter(**ident)
             .select_related("loyalty")
             .first()
         )
@@ -4057,13 +4063,13 @@ class ShopOrdersView(APIView):
     comes from settings, never from the request, for the same reason.
     """
 
-    authentication_classes = [ClerkAuthentication]
-    #: NOT IsAuthenticated — a customer has no Django user. See IsClerkCustomer.
-    permission_classes = [IsClerkCustomer]
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    #: NOT IsAuthenticated — a customer has no Django user. See IsAppCustomer.
+    permission_classes = [IsAppCustomer]
 
     def _resolve(self, request):
-        clerk_id = getattr(request, "clerk_id", None)
-        if not clerk_id:
+        ident = identity_filter(request)
+        if not ident:
             return None, None
         store = models.Store.objects.filter(
             slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
@@ -4072,7 +4078,7 @@ class ShopOrdersView(APIView):
             return None, None
         customer = (
             models.Customer.objects.for_pharmacy(store.pk)
-            .filter(clerk_id=clerk_id)
+            .filter(**ident)
             .first()
         )
         return store, customer
@@ -4159,8 +4165,252 @@ class ShopOrdersView(APIView):
                     profile.save(update_fields=["beans"])
                 order.beans_spent = spend
                 order.save(update_fields=["beans_spent"])
+                push_service.notify_points(
+                    store, customer, -spend, have - spend,
+                    f"استُبدلت في الطلب #{order.pk}",
+                )
 
+        push_service.notify_order_status(order)
         return Response(serializers.OrderSerializer(order).data, status=201)
+
+
+class ShopDeviceView(APIView):
+    """POST /shop/devices/ — this phone can receive push.
+
+    The app calls this on every launch, not only the first, because FCM tokens
+    rotate on their own schedule: after a reinstall, a restore onto a new
+    handset, or for no visible reason at all. Registering once at install time
+    produces an app that silently stops receiving notifications weeks later,
+    which is close to impossible to diagnose from a bug report.
+
+    Upsert on the token, and re-point it at whoever is signed in now — a shared
+    family phone must not keep pushing one person's order to the other.
+    """
+
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    def post(self, request):
+        ident = identity_filter(request)
+        if not ident:
+            return Response({"detail": "جلسة غير صالحة"}, status=401)
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return Response({"detail": "المتجر غير متاح"}, status=503)
+        customer = (
+            models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        )
+        if customer is None:
+            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+
+        token = (request.data.get("token") or "").strip()
+        if not token:
+            return Response({"detail": "token مطلوب"}, status=400)
+        platform = (request.data.get("platform") or "android").strip()
+        if platform not in dict(models.DeviceToken.Platform.choices):
+            platform = models.DeviceToken.Platform.ANDROID
+
+        models.DeviceToken.objects.unscoped().update_or_create(
+            token=token,
+            defaults={
+                "store": store,
+                "customer": customer,
+                "platform": platform,
+                "device_name": (request.data.get("device_name") or "")[:120],
+                "app_version": (request.data.get("app_version") or "")[:40],
+                "last_seen_at": timezone.now(),
+            },
+        )
+        return Response({"ok": True})
+
+    def delete(self, request):
+        """Sign-out. The token must stop resolving to this customer at once."""
+        token = (request.data.get("token") or "").strip()
+        if token:
+            models.DeviceToken.objects.unscoped().filter(token=token).delete()
+        return Response({"ok": True})
+
+
+class ShopOrderCancelView(APIView):
+    """POST /shop/orders/<pk>/cancel/ — the customer changed their mind.
+
+    Only while the order is still `placed`. Once the counter has accepted it
+    somebody has started making the drink, and cancelling then is a
+    conversation with a barista, not an API call.
+
+    Refunding the beans is not optional: they were spent inside the order's
+    transaction, so an order that never happens must not cost anything. The
+    ledger key makes a double-tap on a bad connection idempotent.
+    """
+
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        ident = identity_filter(request)
+        if not ident:
+            return Response({"detail": "جلسة غير صالحة"}, status=401)
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return Response({"detail": "المتجر غير متاح"}, status=503)
+        customer = (
+            models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        )
+        if customer is None:
+            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+
+        # Scoped to their own orders: there is no way to cancel anyone else's.
+        order = (
+            models.Order.objects.for_pharmacy(store.pk)
+            .select_for_update()
+            .filter(pk=pk, customer=customer)
+            .first()
+        )
+        if order is None:
+            return Response({"detail": "الطلب غير موجود"}, status=404)
+        if order.status != models.Order.Status.PLACED:
+            return Response(
+                {"detail": "لا يمكن إلغاء الطلب بعد قبوله، راجع الكاونتر"},
+                status=409,
+            )
+
+        order.status = models.Order.Status.CANCELLED
+        order.cancelled_reason = "أُلغي من التطبيق"
+        order.save(update_fields=["status", "cancelled_reason", "updated_at"])
+
+        refund = int(order.beans_spent or 0)
+        if refund > 0:
+            profile = getattr(customer, "loyalty", None)
+            have = getattr(profile, "beans", 0) or 0
+            _, made = models.BeanLedger.objects.get_or_create(
+                idempotency_key=f"order-refund:{order.pk}",
+                defaults={
+                    "store": store,
+                    "customer": customer,
+                    "delta": refund,
+                    "reason": models.BeanLedger.Reason.ADJUST,
+                    "balance_after": have + refund,
+                    "note": f"إلغاء الطلب #{order.pk}",
+                },
+            )
+            if made and profile is not None:
+                profile.beans = have + refund
+                profile.save(update_fields=["beans"])
+
+        push_service.notify_order_status(order)
+        return Response(serializers.OrderSerializer(order).data)
+
+
+class ShopUsualView(APIView):
+    """GET /shop/usual/ — what they always order, for one-tap reordering.
+
+    The regular's whole relationship with a coffee shop is that nobody has to
+    ask. Most-frequent beats most-recent here: someone who buys the same
+    macchiato daily and tried one iced tea last Friday wants the macchiato.
+    """
+
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    def get(self, request):
+        ident = identity_filter(request)
+        if not ident:
+            return Response({"detail": "جلسة غير صالحة"}, status=401)
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return Response({"results": []})
+        customer = (
+            models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        )
+        if customer is None:
+            return Response({"results": []})
+
+        rows = (
+            models.OrderItem.objects.unscoped()
+            .filter(
+                order__store_id=store.pk,
+                order__customer=customer,
+                order__status=models.Order.Status.COLLECTED,
+                product__isnull=False,
+            )
+            .values("product_id", "variant_id", "name")
+            .annotate(times=Count("id"))
+            .order_by("-times")[:3]
+        )
+        return Response({"results": list(rows)})
+
+
+class ShopNotificationsView(APIView):
+    """GET the in-app feed; POST to mark read.
+
+    This is the durable half of notifications. Push is the doorbell; this is
+    the letterbox, and it still works for everyone who declined permission,
+    turned their phone off, or was in a lift.
+    """
+
+    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    def _resolve(self, request):
+        ident = identity_filter(request)
+        if not ident:
+            return None, None
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return None, None
+        return store, (
+            models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        )
+
+    def get(self, request):
+        store, customer = self._resolve(request)
+        if customer is None:
+            return Response({"results": [], "unread": 0})
+        qs = (
+            models.Notification.objects.for_pharmacy(store.pk)
+            .filter(customer=customer)
+            .order_by("-created_at")[:60]
+        )
+        rows = [
+            {
+                "id": n.pk,
+                "kind": n.kind,
+                "title": n.title,
+                "body": n.body,
+                "data": n.data,
+                "read": n.read_at is not None,
+                "created_at": n.created_at,
+            }
+            for n in qs
+        ]
+        return Response({
+            "results": rows,
+            "unread": sum(1 for r in rows if not r["read"]),
+        })
+
+    def post(self, request):
+        """Mark read. No id = mark everything, which is what closing the
+        notification sheet means."""
+        store, customer = self._resolve(request)
+        if customer is None:
+            return Response({"ok": True})
+        qs = models.Notification.objects.for_pharmacy(store.pk).filter(
+            customer=customer, read_at__isnull=True
+        )
+        ids = request.data.get("ids")
+        if ids:
+            qs = qs.filter(pk__in=[int(i) for i in ids if str(i).isdigit()])
+        qs.update(read_at=timezone.now())
+        return Response({"ok": True})
 
 
 class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
@@ -4211,6 +4461,8 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             )
         order.status = target
         order.save(update_fields=["status", "updated_at"])
+        # The customer is waiting on exactly this. Record + push, after commit.
+        push_service.notify_order_status(order)
         return Response(self.get_serializer(order).data)
 
 

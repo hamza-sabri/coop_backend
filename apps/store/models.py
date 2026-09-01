@@ -521,6 +521,12 @@ class Customer(TimeStampedModel):
     # they are one person: the regular who later installs the app must keep
     # their history, not start a second account.
     clerk_id = models.CharField(max_length=64, blank=True, db_index=True)
+    #: Set when the customer signs into the NATIVE app. Kept alongside
+    #: clerk_id rather than replacing it: the same person may hold both while
+    #: the web PWA is still being retired, and their beans must not split
+    #: across two rows. See accounts/firebase.upsert_customer_from_firebase
+    #: for how an existing Clerk row gets claimed by a verified email.
+    firebase_uid = models.CharField(max_length=128, blank=True, db_index=True)
     email = models.EmailField(blank=True)
     notes = models.TextField(blank=True)
     # Free-text status — indexed so it is searchable and filterable.
@@ -1587,3 +1593,52 @@ class PushSubscription(TimeStampedModel):
 
     def __str__(self):
         return f"{self.customer_id} · {self.endpoint[:40]}…"
+
+
+class DeviceToken(TimeStampedModel):
+    """One installed app's FCM registration token.
+
+    Web Push (PushSubscription, above) and FCM are different transports and do
+    not share a token format, so this is a separate table rather than a
+    nullable column on that one.
+
+    Tokens rotate on their own — after a reinstall, a restore onto a new phone,
+    or when FCM simply decides to. The app re-registers on every launch, which
+    is why `token` is the unique key and the row is upserted: the same phone
+    must never accumulate a trail of dead tokens that push then fans out to.
+    """
+
+    class Platform(models.TextChoices):
+        ANDROID = "android", "Android"
+        IOS = "ios", "iOS"
+
+    store = models.ForeignKey(
+        Store, related_name="device_tokens", on_delete=models.CASCADE
+    )
+    customer = models.ForeignKey(
+        Customer, related_name="device_tokens", on_delete=models.CASCADE
+    )
+    token = models.TextField(unique=True)
+    platform = models.CharField(
+        max_length=10, choices=Platform.choices, default=Platform.ANDROID,
+        db_index=True,
+    )
+    #: Purely for support ("which phone is this?"). Never used for routing.
+    device_name = models.CharField(max_length=120, blank=True)
+    app_version = models.CharField(max_length=40, blank=True)
+    #: Bumped every time the app re-registers, so a token that has not been
+    #: seen in months can be pruned without waiting for FCM to say it is dead.
+    last_seen_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-last_seen_at", "-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        verbose_name = "Device token"
+        verbose_name_plural = "Device tokens"
+
+    def __str__(self):
+        return f"{self.customer_id} · {self.platform} · {self.token[:24]}…"

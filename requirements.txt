@@ -41,3 +41,13 @@ svix==1.45.1                  #   verifies the user.created/updated webhooks
 # Dev conveniences (optional)
 # ---------------------------------------------------------------------------
 django-extensions==3.2.3
+
+# ---------------------------------------------------------------------------
+# Firebase — the native app's auth and push.
+# PyJWT[crypto] verifies ID tokens against Google's public keys (no secret).
+# google-auth + requests are ONLY used to send FCM, and only when
+# FIREBASE_CREDENTIALS is set.
+# ---------------------------------------------------------------------------
+PyJWT[crypto]==2.10.1
+google-auth==2.38.0
+requests==2.32.3
