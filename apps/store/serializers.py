@@ -840,6 +840,7 @@ class SaleSerializer(serializers.ModelSerializer):
             "revision_count",
             "created_at",
             "beans_earned",
+            "beans_spent",
             "is_paid",
             "updated_at",
         ]
@@ -1008,6 +1009,43 @@ class SaleSerializer(serializers.ModelSerializer):
                 sale.discounted_total = (
                     sale.total if discounted is _UNSET else Decimal(discounted)
                 )
+
+                # ── loyalty ──────────────────────────────────────────
+                # Redeem FIRST so the discount lands on the bill, then earn on
+                # what was actually paid. Earning on the pre-discount total
+                # would pay the customer for money they did not spend.
+                #
+                # A return does neither here: it reverses instead, below.
+                if sale.customer_id and not sale.is_return:
+                    from apps.store import points as points_service
+
+                    want = int(self.initial_data.get("beans_spent") or 0)
+                    if want > 0:
+                        spent = points_service.spend_on_purchase(
+                            sale.store, sale.customer, want,
+                            sale.discounted_total,
+                            source="بيع", source_id=sale.pk,
+                        )
+                        if spent > 0:
+                            sale.beans_spent = spent
+                            sale.discounted_total = (
+                                sale.discounted_total
+                                - points_service.value_of(spent)
+                            )
+                            if sale.discounted_total < 0:
+                                sale.discounted_total = Decimal("0.00")
+                    points_service.award_for_purchase(
+                        sale.store, sale.customer, sale.discounted_total,
+                        source="بيع", source_id=sale.pk,
+                    )
+                elif sale.customer_id and sale.is_return:
+                    from apps.store import points as points_service
+
+                    # Goods came back; the points they minted go back too.
+                    points_service.reverse_award(
+                        sale.store, sale.customer, sale.discounted_total,
+                        source="بيع", source_id=sale.pk,
+                    )
 
                 # Credit sale → mirror into a Debt so balances stay correct.
                 # Keyed on customer_id (the raw column), never the related

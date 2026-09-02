@@ -655,6 +655,10 @@ class Sale(TimeStampedModel):
     # Return (استرجاع): stock goes back UP and the amount counts as negative
     # in every sales statistic.
     is_return = models.BooleanField(default=False, db_index=True)
+    #: Points the customer put towards this sale at the counter. A copy of the
+    #: REDEEM ledger row, kept here so a receipt can be reprinted months later
+    #: without walking the ledger.
+    beans_spent = models.IntegerField(default=0)
     # Frozen — computed from the line items, read-only on the API.
     total = models.DecimalField(
         max_digits=12, decimal_places=2, default=Decimal("0.00"), editable=False

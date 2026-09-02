@@ -35,6 +35,7 @@ from apps.accounts.firebase import (
     IsAppCustomer,
     identity_filter,
 )
+from apps.store import points as points_service
 from apps.store import push as push_service
 from . import models, scan_tracking, serializers
 
@@ -3975,10 +3976,11 @@ class ShopMeView(APIView):
 
     #: How many beans a free drink costs. A constant for now — when the shop
     #: wants to tune it, it moves onto Store and this becomes a lookup.
-    REWARD_COST = 260
-    #: Beans per shekel, used both when earning and when redeeming. One
-    #: number, one place: the app used to divide by 3.33 in the browser.
-    POINTS_PER_ILS = 3.33
+    #: Kept as attributes only because other code still reads them off this
+    #: class. The maths itself lives in apps.store.points — one module, so the
+    #: till, the app and the receipt can never quote three different rates.
+    POINTS_PER_ILS = points_service.POINTS_PER_ILS
+    EARN_RATE = points_service.EARN_RATE
 
     def get(self, request):
         ident = identity_filter(request)
@@ -4014,10 +4016,17 @@ class ShopMeView(APIView):
             .filter(customer=customer, is_return=False, created_at__gte=year_start)
             .count()
         )
-        free_cups = (
+        # How many times they have spent points. Not "free cups" any more —
+        # points are cash value now, and a redemption may be part of a bill.
+        redemptions = (
             models.BeanLedger.objects.for_pharmacy(store.pk)
             .filter(customer=customer, reason=models.BeanLedger.Reason.REDEEM)
             .count()
+        )
+        earned_total = (
+            models.BeanLedger.objects.for_pharmacy(store.pk)
+            .filter(customer=customer, delta__gt=0)
+            .aggregate(n=Coalesce(Sum("delta"), 0))["n"]
         )
 
         recent = list(
@@ -4036,11 +4045,14 @@ class ShopMeView(APIView):
             "streak_weeks": getattr(profile, "streak_weeks", 0) or 0,
             "visits_this_month": getattr(profile, "visits_this_month", 0) or 0,
             "cups_this_year": cups_this_year,
-            "free_cups": free_cups,
-            "reward_cost": self.REWARD_COST,
-            # What the home screen's "باقي N نقطة" line needs, computed here so
-            # the phone never has to know the rule.
-            "to_next_reward": max(0, self.REWARD_COST - (beans % self.REWARD_COST)),
+            "redemptions": redemptions,
+            "points_earned_total": earned_total,
+            # The whole scheme, sent to the phone rather than hard-coded in it:
+            # the balance's worth in shekels, and the two rates behind it. When
+            # the shop changes the rate, the app changes with it.
+            "value_ils": str(points_service.value_of(beans)),
+            "points_per_ils": points_service.POINTS_PER_ILS,
+            "earn_rate": str(points_service.EARN_RATE),
             "activity": [
                 {
                     "delta": r["delta"],
@@ -4143,30 +4155,19 @@ class ShopOrdersView(APIView):
             except (TypeError, ValueError):
                 want = 0
         if want:
-            profile = getattr(customer, "loyalty", None)
-            have = getattr(profile, "beans", 0) or 0
-            # Never let a redemption exceed the balance OR the order — points
-            # cannot buy more than the drink costs, and cannot go negative.
-            rate = ShopMeView.POINTS_PER_ILS
-            max_by_total = int(order.total * Decimal(str(rate)))
-            spend = min(want, have, max_by_total)
+            # Clamped server-side against the LIVE balance and the bill: the
+            # number the phone sent was true when the slider moved, which may
+            # have been several minutes and one counter visit ago.
+            spend = points_service.spend_on_purchase(
+                store, customer, want, order.total,
+                source="طلب", source_id=order.pk,
+            )
             if spend > 0:
-                models.BeanLedger.objects.create(
-                    store=store,
-                    customer=customer,
-                    delta=-spend,
-                    reason=models.BeanLedger.Reason.REDEEM,
-                    balance_after=have - spend,
-                    note=f"طلب #{order.pk}",
-                    idempotency_key=f"order-redeem:{order.pk}",
-                )
-                if profile is not None:
-                    profile.beans = have - spend
-                    profile.save(update_fields=["beans"])
                 order.beans_spent = spend
                 order.save(update_fields=["beans_spent"])
                 push_service.notify_points(
-                    store, customer, -spend, have - spend,
+                    store, customer, -spend,
+                    points_service.balance_of(customer),
                     f"استُبدلت في الطلب #{order.pk}",
                 )
 
@@ -4283,24 +4284,10 @@ class ShopOrderCancelView(APIView):
         order.cancelled_reason = "أُلغي من التطبيق"
         order.save(update_fields=["status", "cancelled_reason", "updated_at"])
 
-        refund = int(order.beans_spent or 0)
-        if refund > 0:
-            profile = getattr(customer, "loyalty", None)
-            have = getattr(profile, "beans", 0) or 0
-            _, made = models.BeanLedger.objects.get_or_create(
-                idempotency_key=f"order-refund:{order.pk}",
-                defaults={
-                    "store": store,
-                    "customer": customer,
-                    "delta": refund,
-                    "reason": models.BeanLedger.Reason.ADJUST,
-                    "balance_after": have + refund,
-                    "note": f"إلغاء الطلب #{order.pk}",
-                },
-            )
-            if made and profile is not None:
-                profile.beans = have + refund
-                profile.save(update_fields=["beans"])
+        points_service.refund_spend(
+            store, customer, int(order.beans_spent or 0),
+            source="طلب", source_id=order.pk,
+        )
 
         push_service.notify_order_status(order)
         return Response(serializers.OrderSerializer(order).data)
@@ -4461,6 +4448,26 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             )
         order.status = target
         order.save(update_fields=["status", "updated_at"])
+
+        # Points are minted when the drink is HANDED OVER, not when the order
+        # is placed. An order that is cancelled must never have already paid
+        # out, and the idempotency key makes a double-tap on "collected" move
+        # the balance exactly once.
+        if target == models.Order.Status.COLLECTED:
+            paid = (order.total or Decimal("0")) - points_service.value_of(
+                int(order.beans_spent or 0)
+            )
+            earned = points_service.award_for_purchase(
+                order.store, order.customer, paid,
+                source="طلب", source_id=order.pk,
+            )
+            if earned:
+                push_service.notify_points(
+                    order.store, order.customer, earned,
+                    points_service.balance_of(order.customer),
+                    f"من الطلب #{order.pk}",
+                )
+
         # The customer is waiting on exactly this. Record + push, after commit.
         push_service.notify_order_status(order)
         return Response(self.get_serializer(order).data)

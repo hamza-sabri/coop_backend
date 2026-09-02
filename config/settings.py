@@ -470,3 +470,17 @@ SIGNUP_BONUS_BEANS = int(os.getenv("SIGNUP_BONUS_BEANS", "5") or 5)
 # ---------------------------------------------------------------------------
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "")
+
+
+# ---------------------------------------------------------------------------
+# Loyalty. Two numbers, and they are the only two.
+#
+#   POINTS_EARN_RATE   fraction of the amount paid returned as value (0.02 = 2%)
+#   POINTS_PER_ILS     points that make one shekel (10 = a point is 10 agorot)
+#
+# Together: a 20 ₪ purchase earns 4 points, and 10 points takes 1 ₪ off the
+# next one. Changing these changes what every existing balance is WORTH, so
+# treat them as a business decision, not a config tweak.
+# ---------------------------------------------------------------------------
+POINTS_EARN_RATE = os.getenv("POINTS_EARN_RATE", "0.02")
+POINTS_PER_ILS = int(os.getenv("POINTS_PER_ILS", "10"))
