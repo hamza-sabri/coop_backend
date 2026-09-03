@@ -4454,6 +4454,13 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         # out, and the idempotency key makes a double-tap on "collected" move
         # the balance exactly once.
         if target == models.Order.Status.COLLECTED:
+            # The order becomes a SALE: on the day's takings, in the reports,
+            # and out of stock — everything a counter sale is. Idempotent on
+            # the order, so a double-tap cannot ring it up twice.
+            from apps.store.fulfil import sale_for_order
+
+            sale_for_order(order, created_by=request.user if request.user.is_authenticated else None)
+
             paid = (order.total or Decimal("0")) - points_service.value_of(
                 int(order.beans_spent or 0)
             )
