@@ -102,8 +102,16 @@ def move(store, customer, delta: int, reason: str, note: str, idempotency_key: s
     # Lock the profile row, not the customer: two tills ringing up the same
     # regular at once would otherwise both read the same balance and both write
     # it, losing one of the movements entirely.
-    profile, _ = LoyaltyProfile.objects.select_for_update().get_or_create(
-        store=store, customer=customer, defaults={"beans": 0}
+    # .unscoped() is REQUIRED here, and it is not the escape hatch it looks
+    # like. TenantManager raises on any unscoped read; `select_for_update()`
+    # is a read as far as it is concerned, so the plain manager form threw
+    # TenantScopeError from inside every sale that had a customer attached —
+    # a 500 on the till, with the sale stuck in the offline queue. The row
+    # is still scoped: store and customer are both in the lookup.
+    profile, _ = (
+        LoyaltyProfile.objects.unscoped()
+        .select_for_update()
+        .get_or_create(store=store, customer=customer, defaults={"beans": 0})
     )
     have = int(profile.beans or 0)
 
@@ -114,7 +122,7 @@ def move(store, customer, delta: int, reason: str, note: str, idempotency_key: s
         if delta == 0:
             return None, False
 
-    row, created = BeanLedger.objects.get_or_create(
+    row, created = BeanLedger.objects.unscoped().get_or_create(
         idempotency_key=idempotency_key,
         defaults={
             "store": store,
