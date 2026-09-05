@@ -319,6 +319,11 @@ class ProductSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "manufacturer",
             "category",
             "stock",
+            # On the menu, or not. The column has always existed and
+            # PublicMenuView has always filtered on it — it simply was not on
+            # the serializer, so a drink switched off in the admin was switched
+            # off nowhere at all.
+            "is_active",
             "expiry_date",
             "expiry_alert_days",
             "expiry_status",
@@ -605,6 +610,11 @@ class DebtSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
+    def get_beans_value(self, obj) -> str:
+        from apps.store import points as points_service
+
+        return str(points_service.value_of(obj.beans_spent or 0))
+
     def get_revision_count(self, obj) -> int:
         # Annotated on the list queryset so browsing history stays one query;
         # counted directly for a single sale (detail, and the PATCH response,
@@ -817,6 +827,7 @@ class SaleSerializer(serializers.ModelSerializer):
     discounted_total = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False
     )
+    beans_value = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Sale
@@ -841,10 +852,16 @@ class SaleSerializer(serializers.ModelSerializer):
             "created_at",
             "beans_earned",
             "beans_spent",
+            # What the points took off the bill, in shekels. discounted_total
+            # already has it subtracted; without this the receipt can show a
+            # discount it cannot explain.
+            "beans_value",
             "is_paid",
             "updated_at",
         ]
-        read_only_fields = ["id", "debt", "created_by", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "debt", "created_by", "created_at", "updated_at", "beans_value",
+        ]
 
     def get_revision_count(self, obj) -> int:
         # Annotated on the list queryset so browsing history stays one query;
@@ -1493,6 +1510,14 @@ class OrderSerializer(serializers.ModelSerializer):
     #: discovering them by getting a 400.
     next_statuses = serializers.SerializerMethodField()
     customer_name = serializers.CharField(source="customer.name", read_only=True)
+    #: The bill, split. `total` is what the drinks cost; `beans_spent` is how
+    #: many points came off it, `beans_value` what those points were worth in
+    #: shekels, and `cash_total` what the customer actually hands over. Sent as
+    #: three fields rather than left to the client to divide by ten, because a
+    #: client that does the arithmetic itself is a client that can disagree
+    #: with the till about what someone paid.
+    beans_value = serializers.SerializerMethodField()
+    cash_total = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Order
@@ -1500,6 +1525,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "id", "status", "status_label", "next_statuses",
             "customer", "customer_name", "total", "note",
             "fulfilment", "table_number", "beans_spent",
+            "beans_value", "cash_total",
             "cancelled_reason", "client_uuid", "items",
             "created_at", "updated_at",
         ]
@@ -1513,10 +1539,22 @@ class OrderSerializer(serializers.ModelSerializer):
             # send and must never be trusted with one.
             "id", "status_label", "next_statuses", "total", "customer",
             "customer_name", "created_at", "updated_at", "beans_spent",
+            "beans_value", "cash_total",
         ]
 
     def get_next_statuses(self, obj) -> list:
         return list(models.Order.TRANSITIONS.get(obj.status, ()))
+
+    def get_beans_value(self, obj) -> str:
+        from apps.store import points as points_service
+
+        return str(points_service.value_of(obj.beans_spent or 0))
+
+    def get_cash_total(self, obj) -> str:
+        from apps.store import points as points_service
+
+        due = (obj.total or Decimal("0")) - points_service.value_of(obj.beans_spent or 0)
+        return str(due if due > 0 else Decimal("0.00"))
 
     def create(self, validated):
         items = validated.pop("items", [])

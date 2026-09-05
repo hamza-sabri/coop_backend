@@ -1446,7 +1446,15 @@ class PublicMenuView(APIView):
     CACHE_TTL = 5 * 60
 
     def get(self, request):
-        slug = (request.query_params.get("store") or "").strip()
+        # The native app sends no slug on purpose. It has no hostname to read
+        # one from, and a constant compiled into the binary is a constant that
+        # can disagree with the store every other endpoint in this file
+        # resolves through CLERK_STORE_SLUG — which is exactly how the phone
+        # ended up showing an empty menu while the till was fine. One source
+        # of truth: no slug means "this deployment's store".
+        slug = (request.query_params.get("store") or "").strip() or getattr(
+            settings, "CLERK_STORE_SLUG", ""
+        )
         hit = PublicPriceCheckView._pharmacy_for(slug)
         if not hit:
             return Response({"detail": "غير موجود."}, status=404)
@@ -2419,6 +2427,86 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         payload = {"count": len(rows), "results": rows}
         cache.set(customers_quick_key(self.store_id), payload, CUSTOMERS_QUICK_TTL)
         return Response(payload)
+
+    @action(detail=True, methods=["get", "post"], url_path="points")
+    def points(self, request, pk=None):
+        """One customer's loyalty standing, and a way to move it by hand.
+
+        `GET  /api/v1/customers/{id}/points/`
+            {balance, earned, spent, redemptions, value_ils, points_per_ils,
+             earn_rate, activity[]}
+
+        `POST /api/v1/customers/{id}/points/`  {"delta": 25, "note": "..."}
+            Signed. Positive adds, negative takes away — never a setter, so the
+            ledger stays a list of things that happened rather than a column
+            somebody overwrote. A negative delta is clipped at the balance: a
+            customer cannot be pushed into a debt they have no way to read or
+            clear.
+
+        Idempotent per `client_uuid`. Without one, a cashier double-tapping
+        "+20" on a slow connection credits forty.
+        """
+        import uuid as _uuid
+
+        from apps.store import points as points_service
+
+        customer = self.get_object()
+        store = models.Store.objects.filter(pk=self.store_id).first()
+        if store is None:
+            return Response({"detail": "المتجر غير متاح"}, status=503)
+
+        if request.method == "POST":
+            try:
+                delta = int(request.data.get("delta") or 0)
+            except (TypeError, ValueError):
+                return Response({"detail": "delta غير صالح"}, status=400)
+            if delta == 0:
+                return Response({"detail": "لا يوجد تغيير"}, status=400)
+            # A cap, because this is a manual field on a till: a slipped digit
+            # should be a rejected request, not a customer with 50,000 points.
+            if abs(delta) > 100000:
+                return Response({"detail": "الرقم كبير جداً"}, status=400)
+
+            note = (request.data.get("note") or "").strip()
+            who = getattr(request.user, "username", "") or "staff"
+            key = (request.data.get("client_uuid") or "").strip() or str(_uuid.uuid4())
+            moved = points_service.adjust(
+                store, customer, delta,
+                note or f"تعديل يدوي بواسطة {who}",
+                key=key,
+            )
+            invalidate_customers_quick_cache(self.store_id)
+            if moved:
+                # Told, not silently applied. Points appearing or vanishing
+                # with no explanation is how a loyalty scheme loses trust.
+                push_service.notify_points(
+                    store, customer, moved,
+                    points_service.balance_of(customer),
+                    note or "تعديل من المقهى",
+                )
+            out = points_service.totals_for(store, customer)
+            out["moved"] = moved
+            out["value_ils"] = str(points_service.value_of(out["balance"]))
+            return Response(out, status=200)
+
+        out = points_service.totals_for(store, customer)
+        out["value_ils"] = str(points_service.value_of(out["balance"]))
+        out["points_per_ils"] = points_service.POINTS_PER_ILS
+        out["earn_rate"] = str(points_service.EARN_RATE)
+        out["activity"] = [
+            {
+                "delta": r["delta"],
+                "reason": r["reason"],
+                "note": r["note"],
+                "balance_after": r["balance_after"],
+                "at": r["created_at"].isoformat(),
+            }
+            for r in models.BeanLedger.objects.for_pharmacy(self.store_id)
+            .filter(customer=customer)
+            .order_by("-created_at")[:50]
+            .values("delta", "reason", "note", "balance_after", "created_at")
+        ]
+        return Response(out)
 
     @action(detail=True, methods=["post"])
     def settle(self, request, pk=None):
@@ -4028,6 +4116,13 @@ class ShopMeView(APIView):
             .filter(customer=customer, delta__gt=0)
             .aggregate(n=Coalesce(Sum("delta"), 0))["n"]
         )
+        # Reported positive. "You have used 340 points" is the sentence; a
+        # minus sign in front of it makes the customer read it as a penalty.
+        spent_total = -(
+            models.BeanLedger.objects.for_pharmacy(store.pk)
+            .filter(customer=customer, delta__lt=0)
+            .aggregate(n=Coalesce(Sum("delta"), 0))["n"]
+        )
 
         recent = list(
             models.BeanLedger.objects.for_pharmacy(store.pk)
@@ -4047,6 +4142,7 @@ class ShopMeView(APIView):
             "cups_this_year": cups_this_year,
             "redemptions": redemptions,
             "points_earned_total": earned_total,
+            "points_spent_total": spent_total,
             # The whole scheme, sent to the phone rather than hard-coded in it:
             # the balance's worth in shekels, and the two rates behind it. When
             # the shop changes the rate, the app changes with it.

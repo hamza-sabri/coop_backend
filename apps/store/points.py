@@ -223,3 +223,71 @@ def reverse_award(store, customer, amount, *, source: str, source_id) -> int:
         f"reverse:{source}:{source_id}",
     )
     return points if applied else 0
+
+
+def totals_for(store, customer) -> dict:
+    """Everything earned and everything spent, from the ledger.
+
+    Read off the ledger rather than off `LoyaltyProfile`, because the profile
+    only carries the running balance: it cannot answer "how many have they used
+    so far", which is the question a barista actually gets asked. Two signed
+    sums over rows that are already indexed by (store, customer).
+    """
+    from django.db.models import Q, Sum
+    from django.db.models.functions import Coalesce
+
+    from apps.store.models import BeanLedger
+
+    if customer is None:
+        return {"balance": 0, "earned": 0, "spent": 0, "redemptions": 0}
+
+    agg = (
+        BeanLedger.objects.for_pharmacy(getattr(store, "pk", store))
+        .filter(customer=customer)
+        .aggregate(
+            earned=Coalesce(Sum("delta", filter=Q(delta__gt=0)), 0),
+            # Stored negative; reported as a positive count of points used.
+            spent=Coalesce(Sum("delta", filter=Q(delta__lt=0)), 0),
+        )
+    )
+    redemptions = (
+        BeanLedger.objects.for_pharmacy(getattr(store, "pk", store))
+        .filter(customer=customer, reason=BeanLedger.Reason.REDEEM)
+        .count()
+    )
+    return {
+        "balance": balance_of(customer),
+        "earned": int(agg["earned"] or 0),
+        "spent": -int(agg["spent"] or 0),
+        "redemptions": redemptions,
+    }
+
+
+def adjust(store, customer, delta: int, note: str, *, key: str) -> int:
+    """A human moving somebody's points by hand. Returns what actually moved.
+
+    The counter needs this for the cases the automatic rules cannot see: a
+    drink remade, an apology, a card handed over before the app existed, a
+    mistake to undo. It is deliberately NOT a setter — you say "+20" or "-20",
+    never "= 40" — so the ledger stays a story of movements and the balance
+    stays derivable from it.
+
+    `key` is the caller's idempotency key. A cashier double-tapping the button
+    must not credit twice; two DIFFERENT adjustments of the same size on the
+    same day must both land. Only the caller knows which is which, so only the
+    caller can supply it.
+    """
+    from apps.store.models import BeanLedger
+
+    if customer is None or not delta:
+        return 0
+    row, applied = move(
+        store, customer, int(delta), BeanLedger.Reason.ADJUST,
+        (note or "").strip()[:255] or "تعديل يدوي",
+        f"adjust:{key}",
+    )
+    if not applied or row is None:
+        return 0
+    # move() clips a negative movement at the balance, so report the ledger
+    # row's delta — what happened — not the delta that was asked for.
+    return int(row.delta)
