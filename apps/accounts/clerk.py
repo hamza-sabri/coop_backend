@@ -46,6 +46,35 @@ class ClerkAuthentication(authentication.BaseAuthentication):
         header = request.META.get("HTTP_AUTHORIZATION", "")
         if not header.lower().startswith("bearer "):
             return None
+        token = header.split(" ", 1)[1].strip()
+
+        # ── hands off other people's tokens ──────────────────────────────
+        #
+        # This is the bug that stopped the native app from placing a single
+        # order, and it is worth spelling out because it is invisible from
+        # either end.
+        #
+        # DRF runs authenticators in order and STOPS at the first one that
+        # raises. The shop views list [FirebaseAuthentication,
+        # ClerkAuthentication]: Firebase verified the app's token, set
+        # request.firebase_uid, and returned None — correctly, because a
+        # customer is not a Django user. DRF then handed the SAME token to
+        # Clerk, which of course could not verify a Firebase ID token, and
+        # raised. The 401 that came back said "جلسة غير صالحة", which is a lie
+        # about a session that was perfectly valid and had already been
+        # accepted one line earlier.
+        #
+        # So: if Firebase has already claimed this request, or the token is
+        # plainly a Firebase one, this authenticator has nothing to say.
+        if getattr(request, "firebase_uid", None):
+            return None
+        try:
+            from apps.accounts.firebase import looks_like_firebase
+
+            if looks_like_firebase(token):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
 
         try:
             import httpx
@@ -111,7 +140,7 @@ class IsClerkCustomer(permissions.BasePermission):
     So the permission checks what the authenticator actually sets.
     """
 
-    message = "جلسة غير صالحة"
+    message = "سجّل دخولك للمتابعة"
 
     def has_permission(self, request, view) -> bool:
         return bool(getattr(request, "clerk_id", None))

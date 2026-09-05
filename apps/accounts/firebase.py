@@ -72,6 +72,29 @@ def _client():
     return _jwks_client
 
 
+def looks_like_firebase(token: str) -> bool:
+    """Is this a Firebase ID token? — read, do not verify.
+
+    A Clerk session token arrives in the same `Bearer` header, so the
+    authenticator has to know whose token it is holding before it can decide
+    whether a failure is "not mine, pass it on" or "yours, and broken". Reading
+    the unverified `iss` claim is safe precisely because nothing is trusted
+    from it: the answer only routes the token to the right verifier, which then
+    checks the signature properly.
+    """
+    try:
+        import base64
+
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(body))
+        return str(claims.get("iss", "")).startswith(
+            "https://securetoken.google.com/"
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def verify_id_token(token: str) -> dict:
     """Verify a Firebase ID token and return its claims. Raises on anything off.
 
@@ -83,7 +106,17 @@ def verify_id_token(token: str) -> dict:
 
     pid = project_id()
     if not pid:
-        raise exceptions.AuthenticationFailed("جلسة غير صالحة")
+        # Not the customer's problem, and not something signing in again can
+        # fix: this deployment has no FIREBASE_PROJECT_ID, so no token from the
+        # app can ever be verified. Said plainly, because the generic "session
+        # invalid" sent whoever saw it round the sign-in loop forever.
+        log.error(
+            "firebase: FIREBASE_PROJECT_ID is not set — every app request "
+            "will be rejected. Set it in the deployment environment."
+        )
+        raise exceptions.AuthenticationFailed(
+            "تسجيل الدخول من التطبيق غير مفعّل على الخادم"
+        )
 
     try:
         signing_key = _client().get_signing_key_from_jwt(token)
@@ -98,14 +131,16 @@ def verify_id_token(token: str) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("firebase: token verification failed: %s", exc)
-        raise exceptions.AuthenticationFailed("جلسة غير صالحة")
+        raise exceptions.AuthenticationFailed(
+            "انتهت الجلسة. سجّل دخولك من جديد"
+        )
 
     if not claims.get("sub"):
-        raise exceptions.AuthenticationFailed("جلسة غير صالحة")
+        raise exceptions.AuthenticationFailed("انتهت الجلسة. سجّل دخولك من جديد")
     # A token cannot have been issued for a sign-in that has not happened yet.
     auth_time = claims.get("auth_time")
     if auth_time and int(auth_time) > time.time() + 60:
-        raise exceptions.AuthenticationFailed("جلسة غير صالحة")
+        raise exceptions.AuthenticationFailed("انتهت الجلسة. سجّل دخولك من جديد")
     return claims
 
 
@@ -120,8 +155,6 @@ class FirebaseAuthentication(authentication.BaseAuthentication):
     keyword = "Bearer"
 
     def authenticate(self, request):
-        if not firebase_enabled():
-            return None
         header = request.META.get("HTTP_AUTHORIZATION", "")
         if not header.lower().startswith("bearer "):
             return None
@@ -129,16 +162,18 @@ class FirebaseAuthentication(authentication.BaseAuthentication):
         if not token:
             return None
 
-        # A Clerk session token also arrives as `Bearer ...`. Rather than
-        # guessing, let this fail quietly and hand the request to the Clerk
-        # authenticator, which DRF tries next. Only a token that is genuinely
-        # a Firebase ID token gets an identity here.
-        try:
-            claims = verify_id_token(token)
-        except exceptions.AuthenticationFailed:
-            if getattr(settings, "CLERK_SECRET_KEY", ""):
-                return None
-            raise
+        # A Clerk session token arrives in the same header. Decide whose token
+        # this is FIRST, then fail properly.
+        #
+        # The previous version returned None whenever Clerk was configured, so
+        # every Firebase problem — an expired token, a wrong project id, a
+        # missing FIREBASE_PROJECT_ID — came out of the far end of the stack as
+        # the permission class's flat "جلسة غير صالحة", with no clue which of
+        # those it was and nothing in the log. A real error is worth more than
+        # a tidy fallback.
+        if not looks_like_firebase(token):
+            return None
+        claims = verify_id_token(token)
 
         request.firebase_uid = claims["sub"]
         request.firebase_claims = claims
@@ -154,7 +189,7 @@ class IsAppCustomer(permissions.BasePermission):
     what the authenticators actually set.
     """
 
-    message = "جلسة غير صالحة"
+    message = "سجّل دخولك للمتابعة"
 
     def has_permission(self, request, view) -> bool:
         return bool(
@@ -273,17 +308,48 @@ class FirebaseSyncView(View):
     work before any customer row exists.
     """
 
+    def get(self, request, *args, **kwargs):
+        """Is app sign-in wired up on this deployment? — one curl, no token.
+
+        Exists because the failure it diagnoses is invisible from the outside:
+        an unset FIREBASE_PROJECT_ID rejects every request from the app in a
+        way that looks, from the phone, exactly like a session that expired.
+        The project id is not a secret — it ships inside the app's own
+        google-services.json — so answering it here costs nothing and saves an
+        afternoon.
+        """
+        return JsonResponse({
+            "enabled": firebase_enabled(),
+            "project_id": project_id(),
+            "store_slug": getattr(settings, "CLERK_STORE_SLUG", ""),
+        })
+
     def post(self, request, *args, **kwargs):
         if not firebase_enabled():
-            return JsonResponse({"ok": False, "reason": "firebase off"}, status=503)
+            log.error(
+                "firebase: /firebase/sync/ called but FIREBASE_PROJECT_ID is "
+                "not set — the app cannot sign anyone in against this server."
+            )
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "detail": "تسجيل الدخول من التطبيق غير مفعّل على الخادم",
+                    "reason": "FIREBASE_PROJECT_ID is not set",
+                },
+                status=503,
+            )
 
         header = request.META.get("HTTP_AUTHORIZATION", "")
         if not header.lower().startswith("bearer "):
-            return JsonResponse({"ok": False}, status=401)
+            return JsonResponse(
+                {"ok": False, "detail": "سجّل دخولك للمتابعة"}, status=401
+            )
         try:
             claims = verify_id_token(header.split(" ", 1)[1].strip())
-        except exceptions.AuthenticationFailed:
-            return JsonResponse({"ok": False}, status=401)
+        except exceptions.AuthenticationFailed as exc:
+            return JsonResponse(
+                {"ok": False, "detail": str(exc.detail)}, status=401
+            )
 
         try:
             body = json.loads(request.body or b"{}")

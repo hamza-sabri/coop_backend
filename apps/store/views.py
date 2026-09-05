@@ -2453,7 +2453,7 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         customer = self.get_object()
         store = models.Store.objects.filter(pk=self.store_id).first()
         if store is None:
-            return Response({"detail": "المتجر غير متاح"}, status=503)
+            return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
 
         if request.method == "POST":
             try:
@@ -4073,13 +4073,13 @@ class ShopMeView(APIView):
     def get(self, request):
         ident = identity_filter(request)
         if not ident:
-            return Response({"detail": "جلسة غير صالحة"}, status=401)
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
 
         store = models.Store.objects.filter(
             slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
         ).first()
         if store is None:
-            return Response({"detail": "المتجر غير متاح"}, status=503)
+            return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
 
         customer = (
             models.Customer.objects.for_pharmacy(store.pk)
@@ -4207,7 +4207,7 @@ class ShopOrdersView(APIView):
     def post(self, request):
         store, customer = self._resolve(request)
         if customer is None:
-            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+            return Response({"detail": "حسابك لسه ما اكتمل. أعد تسجيل الدخول"}, status=409)
 
         # Idempotency: a phone on a bad connection retries, and must not order
         # twice. Same contract the offline POS uses for sales.
@@ -4290,17 +4290,17 @@ class ShopDeviceView(APIView):
     def post(self, request):
         ident = identity_filter(request)
         if not ident:
-            return Response({"detail": "جلسة غير صالحة"}, status=401)
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
         store = models.Store.objects.filter(
             slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
         ).first()
         if store is None:
-            return Response({"detail": "المتجر غير متاح"}, status=503)
+            return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
         customer = (
             models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
         )
         if customer is None:
-            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+            return Response({"detail": "حسابك لسه ما اكتمل. أعد تسجيل الدخول"}, status=409)
 
         token = (request.data.get("token") or "").strip()
         if not token:
@@ -4349,17 +4349,17 @@ class ShopOrderCancelView(APIView):
     def post(self, request, pk=None):
         ident = identity_filter(request)
         if not ident:
-            return Response({"detail": "جلسة غير صالحة"}, status=401)
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
         store = models.Store.objects.filter(
             slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
         ).first()
         if store is None:
-            return Response({"detail": "المتجر غير متاح"}, status=503)
+            return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
         customer = (
             models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
         )
         if customer is None:
-            return Response({"detail": "لا يوجد حساب زبون"}, status=409)
+            return Response({"detail": "حسابك لسه ما اكتمل. أعد تسجيل الدخول"}, status=409)
 
         # Scoped to their own orders: there is no way to cancel anyone else's.
         order = (
@@ -4403,7 +4403,7 @@ class ShopUsualView(APIView):
     def get(self, request):
         ident = identity_filter(request)
         if not ident:
-            return Response({"detail": "جلسة غير صالحة"}, status=401)
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
         store = models.Store.objects.filter(
             slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
         ).first()
