@@ -209,6 +209,23 @@ def invalidate_pos_catalog_cache(pid):
     cache.delete(catalog_version_key(pid))
 
 
+def business_day_start():
+    """When the CURRENT trading day began, in the shop's own timezone.
+
+    Not midnight. A café still serving at 00:30 has not started a new day —
+    the owner cashes up once, in the morning, and BUSINESS_DAY_START_HOUR is
+    the hour that happens. The takings screen has always counted this way;
+    the orders board now resets on the same boundary, so "today" means the
+    same thing on both.
+    """
+    from datetime import datetime, time as dtime
+
+    hour = int(getattr(settings, "BUSINESS_DAY_START_HOUR", 0))
+    now = timezone.localtime()
+    day = now.date() if now.hour >= hour else now.date() - timedelta(days=1)
+    return timezone.make_aware(datetime.combine(day, dtime(hour=hour)), now.tzinfo)
+
+
 def invalidate_customers_quick_cache(pid):
     cache.delete(customers_quick_key(pid))
 
@@ -4601,13 +4618,15 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         )
         rows = list(qs)
 
-        # Today's finished orders ride along so a mis-click is recoverable
-        # from the board. Marking the wrong cup collected is the easiest
-        # mistake to make here and, until now, the only one that needed a
-        # database query to undo.
-        start_of_day = timezone.now().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        # The board's last two columns: everything finished so far TODAY,
+        # delivered and cancelled. They are part of the board rather than a
+        # history page because a barista is asked "did #12 go out?" all day,
+        # and because marking the wrong cup collected is the easiest mistake
+        # on this screen — with the card still on the board it is one drag to
+        # put right instead of a database query.
+        #
+        # "Today" is the trading day, not the calendar day: an order served at
+        # 00:30 belongs to the shift that is still running.
         recent = list(
             self.get_queryset()
             .filter(
@@ -4615,9 +4634,9 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                     models.Order.Status.COLLECTED,
                     models.Order.Status.CANCELLED,
                 ),
-                updated_at__gte=start_of_day,
+                updated_at__gte=business_day_start(),
             )
-            .order_by("-updated_at")[:12]
+            .order_by("-updated_at")[:120]
         )
 
         return Response({
