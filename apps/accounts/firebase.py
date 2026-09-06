@@ -318,10 +318,19 @@ class FirebaseSyncView(View):
         google-services.json — so answering it here costs nothing and saves an
         afternoon.
         """
+        # Sign-in and SENDING are two different credentials, and only one of
+        # them is set in most deployments — which is why "I get no
+        # notifications" is such a hard thing to diagnose from a phone. Both
+        # are reported here, and neither answer is a secret: the project id
+        # ships inside the app's own google-services.json, and this only says
+        # whether a service account is present, never what is in it.
+        from apps.store import push as push_service
+
         return JsonResponse({
             "enabled": firebase_enabled(),
             "project_id": project_id(),
             "store_slug": getattr(settings, "CLERK_STORE_SLUG", ""),
+            "push_configured": bool(push_service._credentials()),
         })
 
     def post(self, request, *args, **kwargs):
