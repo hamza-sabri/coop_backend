@@ -84,6 +84,37 @@ def balance_of(customer) -> int:
     return int(getattr(profile, "beans", 0) or 0)
 
 
+def cycle_of(kind: str, source: str, source_id) -> int:
+    """How many times this movement has already happened for this thing.
+
+    An order can now be collected, un-collected and collected again, and each
+    of those has to move the balance — while a RETRIED request must still move
+    it once. Those two requirements pull in opposite directions and the
+    idempotency key is where they meet: it stays constant across retries of the
+    same event and changes between genuine repeats of it.
+
+    So the key carries a cycle number, counted from the ledger itself rather
+    than from a column on Order, which keeps this a pure function of history
+    and needs no migration. Cycle 0 keeps the ORIGINAL key shape, so every
+    ledger row already written stays matched.
+    """
+    from django.db.models import Q
+
+    from apps.store.models import BeanLedger
+
+    base = f"{kind}:{source}:{source_id}"
+    return (
+        BeanLedger.objects.unscoped()
+        .filter(Q(idempotency_key=base) | Q(idempotency_key__startswith=f"{base}#"))
+        .count()
+    )
+
+
+def _key(kind: str, source: str, source_id, cycle: int) -> str:
+    base = f"{kind}:{source}:{source_id}"
+    return base if not cycle else f"{base}#{cycle}"
+
+
 @transaction.atomic
 def move(store, customer, delta: int, reason: str, note: str, idempotency_key: str):
     """Apply a signed movement. Returns (ledger_row, applied: bool).
@@ -141,7 +172,7 @@ def move(store, customer, delta: int, reason: str, note: str, idempotency_key: s
     return row, True
 
 
-def award_for_purchase(store, customer, amount, *, source: str, source_id) -> int:
+def award_for_purchase(store, customer, amount, *, source: str, source_id, cycle: int = 0) -> int:
     """Mint points for a completed purchase. Returns the points awarded.
 
     Called when the goods are actually handed over — an order marked collected,
@@ -159,12 +190,12 @@ def award_for_purchase(store, customer, amount, *, source: str, source_id) -> in
     _, applied = move(
         store, customer, points, BeanLedger.Reason.EARN,
         f"نقاط {source} #{source_id}",
-        f"earn:{source}:{source_id}",
+        _key("earn", source, source_id, cycle),
     )
     return points if applied else 0
 
 
-def spend_on_purchase(store, customer, points: int, amount, *, source: str, source_id) -> int:
+def spend_on_purchase(store, customer, points: int, amount, *, source: str, source_id, cycle: int = 0) -> int:
     """Redeem points against a bill. Returns how many were actually spent.
 
     Clamped server-side against the live balance and the bill, because the
@@ -184,12 +215,12 @@ def spend_on_purchase(store, customer, points: int, amount, *, source: str, sour
     _, applied = move(
         store, customer, -spend, BeanLedger.Reason.REDEEM,
         f"استبدال في {source} #{source_id}",
-        f"redeem:{source}:{source_id}",
+        _key("redeem", source, source_id, cycle),
     )
     return spend if applied else 0
 
 
-def refund_spend(store, customer, points: int, *, source: str, source_id) -> int:
+def refund_spend(store, customer, points: int, *, source: str, source_id, cycle: int = 0) -> int:
     """Give back points spent on something that did not happen."""
     if customer is None or not points or points <= 0:
         return 0
@@ -198,12 +229,12 @@ def refund_spend(store, customer, points: int, *, source: str, source_id) -> int
     _, applied = move(
         store, customer, int(points), BeanLedger.Reason.ADJUST,
         f"إلغاء {source} #{source_id}",
-        f"refund:{source}:{source_id}",
+        _key("refund", source, source_id, cycle),
     )
     return int(points) if applied else 0
 
 
-def reverse_award(store, customer, amount, *, source: str, source_id) -> int:
+def reverse_award(store, customer, amount, *, source: str, source_id, cycle: int = 0) -> int:
     """Take back points minted for a purchase that was then returned.
 
     Deliberately allowed to be clipped by `move()` if the customer has already
@@ -220,7 +251,7 @@ def reverse_award(store, customer, amount, *, source: str, source_id) -> int:
     _, applied = move(
         store, customer, -points, BeanLedger.Reason.ADJUST,
         f"إرجاع {source} #{source_id}",
-        f"reverse:{source}:{source_id}",
+        _key("reverse", source, source_id, cycle),
     )
     return points if applied else 0
 

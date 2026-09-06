@@ -1380,17 +1380,54 @@ class Order(TimeStampedModel):
         COLLECTED = "collected", "تم الاستلام"
         CANCELLED = "cancelled", "ملغى"
 
-    #: Which statuses may follow which. Enforced in one place so a stray API
-    #: call cannot walk an order backwards from collected to preparing, and so
-    #: the customer app can grey out impossible buttons from the same table.
+    #: Which statuses may follow which — now, every one of them.
+    #:
+    #: This was a one-step ladder: placed → accepted → preparing → ready →
+    #: collected, forwards only, with cancel hanging off each rung. That is a
+    #: correct description of how an order SHOULD go and a poor description of
+    #: what happens at a counter. A barista taps "ready" for the wrong cup; two
+    #: orders come up together and one gets marked collected; somebody
+    #: cancels, and ten seconds later the customer walks in after all. Under
+    #: the ladder every one of those is unrecoverable through the UI, and the
+    #: fix is a database query.
+    #:
+    #: So the graph is complete. What makes that safe is not the table — it is
+    #: that OrderViewSet.advance() now RECONCILES the money on every move
+    #: rather than firing side effects forwards: leaving `collected` voids the
+    #: sale it created and takes the points back, leaving `cancelled` re-charges
+    #: the points it refunded, and each of those is keyed per cycle so an order
+    #: can be collected, un-collected and collected again without the balance
+    #: drifting. A status is a fact about the drink, and it should be as easy
+    #: to correct as any other fact somebody typed.
     TRANSITIONS: dict[str, tuple[str, ...]] = {
-        Status.PLACED: (Status.ACCEPTED, Status.CANCELLED),
-        Status.ACCEPTED: (Status.PREPARING, Status.CANCELLED),
-        Status.PREPARING: (Status.READY, Status.CANCELLED),
-        Status.READY: (Status.COLLECTED, Status.CANCELLED),
-        Status.COLLECTED: (),
-        Status.CANCELLED: (),
+        Status.PLACED: (
+            Status.ACCEPTED, Status.PREPARING, Status.READY,
+            Status.COLLECTED, Status.CANCELLED,
+        ),
+        Status.ACCEPTED: (
+            Status.PLACED, Status.PREPARING, Status.READY,
+            Status.COLLECTED, Status.CANCELLED,
+        ),
+        Status.PREPARING: (
+            Status.PLACED, Status.ACCEPTED, Status.READY,
+            Status.COLLECTED, Status.CANCELLED,
+        ),
+        Status.READY: (
+            Status.PLACED, Status.ACCEPTED, Status.PREPARING,
+            Status.COLLECTED, Status.CANCELLED,
+        ),
+        Status.COLLECTED: (
+            Status.PLACED, Status.ACCEPTED, Status.PREPARING,
+            Status.READY, Status.CANCELLED,
+        ),
+        Status.CANCELLED: (
+            Status.PLACED, Status.ACCEPTED, Status.PREPARING,
+            Status.READY, Status.COLLECTED,
+        ),
     }
+
+    #: The states in which somebody is waiting for a drink.
+    OPEN_STATUSES = (Status.PLACED, Status.ACCEPTED, Status.PREPARING, Status.READY)
 
     store = models.ForeignKey(
         Store, related_name="orders", on_delete=models.CASCADE

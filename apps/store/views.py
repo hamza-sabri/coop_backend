@@ -4600,8 +4600,29 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             .order_by("created_at")
         )
         rows = list(qs)
+
+        # Today's finished orders ride along so a mis-click is recoverable
+        # from the board. Marking the wrong cup collected is the easiest
+        # mistake to make here and, until now, the only one that needed a
+        # database query to undo.
+        start_of_day = timezone.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        recent = list(
+            self.get_queryset()
+            .filter(
+                status__in=(
+                    models.Order.Status.COLLECTED,
+                    models.Order.Status.CANCELLED,
+                ),
+                updated_at__gte=start_of_day,
+            )
+            .order_by("-updated_at")[:12]
+        )
+
         return Response({
             "results": serializers.OrderSerializer(rows, many=True).data,
+            "recent": serializers.OrderSerializer(recent, many=True).data,
             "pending": sum(
                 1 for o in rows if o.status == models.Order.Status.PLACED
             ),
@@ -4609,41 +4630,101 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         })
 
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def advance(self, request, pk=None):
-        """POST {status} — move an order one legal step."""
+        """POST {status} — put this order in that state. Any state.
+
+        The ladder is gone (see Order.TRANSITIONS). What replaces it is not
+        "no rules" but a different KIND of rule: instead of asking whether a
+        move is allowed, this asks what the money should look like once the
+        move has happened, and makes it look like that.
+
+        Two states have consequences, and both are now symmetric:
+
+          collected  — the order becomes a Sale: takings, reports, stock.
+                       Entering it creates one; LEAVING it voids that one and
+                       takes the earned points back.
+          cancelled  — points the customer spent are given back. Leaving it
+                       charges them again, because the order is live once more.
+
+        Every movement is keyed with a cycle number, so an order can go round
+        that loop as many times as a busy counter needs it to and the balance
+        lands where it should. The row is locked for the whole thing: two
+        screens can be showing the same card.
+        """
+        from apps.store.fulfil import sale_for_order, void_sale_for_order
+
         order = self.get_object()
+        # Re-read under lock. get_object() read it a moment ago and this method
+        # both branches on and rewrites the status.
+        order = (
+            models.Order.objects.unscoped()
+            .select_for_update()
+            .select_related("customer", "store", "sale")
+            .get(pk=order.pk)
+        )
+
         target = (request.data.get("status") or "").strip()
+        if target not in models.Order.Status.values:
+            return Response({"detail": "حالة غير معروفة"}, status=400)
+
+        previous = order.status
+        if target == previous:
+            # A retry, or a card dropped back where it came from. Not an error,
+            # and — importantly — not an event: nothing may move twice because
+            # somebody's connection was slow.
+            return Response(self.get_serializer(order).data)
+
         if not order.can_move_to(target):
             return Response(
-                {"detail": f"لا يمكن الانتقال من {order.status} إلى {target}"},
+                {"detail": f"لا يمكن الانتقال من {previous} إلى {target}"},
                 status=400,
             )
+
+        COLLECTED = models.Order.Status.COLLECTED
+        CANCELLED = models.Order.Status.CANCELLED
+        spent = int(order.beans_spent or 0)
+
         order.status = target
         fields = ["status", "updated_at"]
-        if target == models.Order.Status.CANCELLED:
+        if target == CANCELLED:
             reason = (request.data.get("reason") or "").strip()[:255]
             order.cancelled_reason = reason or "أُلغي من الكاونتر"
             fields.append("cancelled_reason")
+        elif previous == CANCELLED:
+            order.cancelled_reason = ""
+            fields.append("cancelled_reason")
         order.save(update_fields=fields)
 
-        # Points are minted when the drink is HANDED OVER, not when the order
-        # is placed. An order that is cancelled must never have already paid
-        # out, and the idempotency key makes a double-tap on "collected" move
-        # the balance exactly once.
-        if target == models.Order.Status.COLLECTED:
-            # The order becomes a SALE: on the day's takings, in the reports,
-            # and out of stock — everything a counter sale is. Idempotent on
-            # the order, so a double-tap cannot ring it up twice.
-            from apps.store.fulfil import sale_for_order
-
-            sale_for_order(order, created_by=request.user if request.user.is_authenticated else None)
-
-            paid = (order.total or Decimal("0")) - points_service.value_of(
-                int(order.beans_spent or 0)
+        # ── leaving `collected`: the sale it made never happened ──────────
+        if previous == COLLECTED:
+            paid = (order.total or Decimal("0")) - points_service.value_of(spent)
+            void_sale_for_order(order)
+            points_service.reverse_award(
+                order.store, order.customer, paid,
+                source="طلب", source_id=order.pk,
+                cycle=points_service.cycle_of("reverse", "طلب", order.pk),
             )
+
+        # ── leaving `cancelled`: it is a live order again, so it costs ────
+        if previous == CANCELLED and spent:
+            points_service.spend_on_purchase(
+                order.store, order.customer, spent, order.total,
+                source="طلب", source_id=order.pk,
+                cycle=points_service.cycle_of("redeem", "طلب", order.pk),
+            )
+
+        # ── entering `collected`: takings, stock, points ──────────────────
+        if target == COLLECTED:
+            sale_for_order(
+                order,
+                created_by=request.user if request.user.is_authenticated else None,
+            )
+            paid = (order.total or Decimal("0")) - points_service.value_of(spent)
             earned = points_service.award_for_purchase(
                 order.store, order.customer, paid,
                 source="طلب", source_id=order.pk,
+                cycle=points_service.cycle_of("earn", "طلب", order.pk),
             )
             if earned:
                 push_service.notify_points(
@@ -4652,19 +4733,17 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                     f"من الطلب #{order.pk}",
                 )
 
-        # A cancellation must give the points back. The customer's own cancel
-        # path has always done this; the counter's did not, so a barista
-        # cancelling an order the customer had paid points towards took the
-        # points and gave nothing back. Same idempotency key as the app's
-        # cancel, so the two can race and the balance still moves once.
-        if target == models.Order.Status.CANCELLED and order.beans_spent:
+        # ── entering `cancelled`: give the spent points back ──────────────
+        if target == CANCELLED and spent:
             points_service.refund_spend(
-                order.store, order.customer, int(order.beans_spent or 0),
+                order.store, order.customer, spent,
                 source="طلب", source_id=order.pk,
+                cycle=points_service.cycle_of("refund", "طلب", order.pk),
             )
 
         # The customer is waiting on exactly this. Record + push, after commit.
         push_service.notify_order_status(order)
+        order.refresh_from_db()
         return Response(self.get_serializer(order).data)
 
 
