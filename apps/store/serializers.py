@@ -610,11 +610,6 @@ class DebtSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "created_by", "created_at", "updated_at"]
 
-    def get_beans_value(self, obj) -> str:
-        from apps.store import points as points_service
-
-        return str(points_service.value_of(obj.beans_spent or 0))
-
     def get_revision_count(self, obj) -> int:
         # Annotated on the list queryset so browsing history stays one query;
         # counted directly for a single sale (detail, and the PATCH response,
@@ -862,6 +857,11 @@ class SaleSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "debt", "created_by", "created_at", "updated_at", "beans_value",
         ]
+
+    def get_beans_value(self, obj) -> str:
+        from apps.store import points as points_service
+
+        return str(points_service.value_of(obj.beans_spent or 0))
 
     def get_revision_count(self, obj) -> int:
         # Annotated on the list queryset so browsing history stays one query;
