@@ -432,6 +432,14 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
     # Loyalty, read-only: the admin's customers list shows who signed up in the
     # app and where they stand, without a second request per row.
     beans = serializers.IntegerField(source="loyalty.beans", read_only=True, default=0)
+    #: The same number as `beans`, under the name the admin has always asked
+    #: for. CustomerViewSet annotates `points` (that is what ?ordering=-points
+    #: sorts on) but it was never on this serializer, so every customer card
+    #: and every profile page read `customer.points` off a payload that did not
+    #: contain it and rendered a confident, permanent zero. Kept as its own
+    #: field rather than renaming `beans`, because `beans` is in the generated
+    #: client and on the POS picker.
+    points = serializers.SerializerMethodField()
     tier = serializers.CharField(source="loyalty.tier", read_only=True, default="single")
     signed_up = serializers.SerializerMethodField()
     # Declared explicitly (instead of the auto unique validator) so blanks map to
@@ -452,6 +460,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "clerk_id",
             "email",
             "beans",
+            "points",
             "tier",
             "signed_up",
             "notes",
@@ -462,6 +471,20 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_points(self, obj) -> int:
+        """The annotation when it is there, the loyalty row when it is not.
+
+        Both paths, because this serializer is used by the customers list
+        (annotated) and by the POS and the profile page (not always), and a
+        balance that is right on one screen and zero on another is worse than
+        one that is simply wrong.
+        """
+        annotated = getattr(obj, "points", None)
+        if annotated is not None:
+            return int(annotated)
+        profile = getattr(obj, "loyalty", None)
+        return int(getattr(profile, "beans", 0) or 0)
 
     def create(self, validated_data):
         cu = validated_data.get("client_uuid")

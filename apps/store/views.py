@@ -4657,9 +4657,15 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         order = self.get_object()
         # Re-read under lock. get_object() read it a moment ago and this method
         # both branches on and rewrites the status.
+        # of=("self",) is load-bearing on Postgres. `sale` is a NULLABLE FK, so
+        # select_related() joins it as a LEFT OUTER JOIN, and Postgres refuses
+        # to lock the nullable side of an outer join:
+        #   "FOR UPDATE cannot be applied to the nullable side of an outer join"
+        # Naming `self` locks the order row and nothing else, which is all this
+        # ever wanted — the sale and the customer are read, not written, here.
         order = (
             models.Order.objects.unscoped()
-            .select_for_update()
+            .select_for_update(of=("self",))
             .select_related("customer", "store", "sale")
             .get(pk=order.pk)
         )
