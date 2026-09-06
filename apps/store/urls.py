@@ -66,6 +66,8 @@ urlpatterns = router.urls + [
     path("public/branding/icon/", views.PublicBrandingIconView.as_view(), name="public-branding-icon"),
     path("import/hesabate/products/", views.HesabateImportProductsView.as_view(), name="import-products"),
     path("import/hesabate/sales/", views.HesabateImportSalesView.as_view(), name="import-sales"),
+    # Cashing up: the shift that is ending, uncached.
+    path("reports/today/", views.ReportsTodayView.as_view(), name="reports-today"),
     # The café's own report — drinks, hours, the app, the loyalty scheme.
     path("reports/cafe/", views.ReportsCafeView.as_view(), name="reports-cafe"),
     path("reports/summary/", views.ReportsSummaryView.as_view(), name="reports-summary"),
