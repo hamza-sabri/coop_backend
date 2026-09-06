@@ -66,6 +66,8 @@ urlpatterns = router.urls + [
     path("public/branding/icon/", views.PublicBrandingIconView.as_view(), name="public-branding-icon"),
     path("import/hesabate/products/", views.HesabateImportProductsView.as_view(), name="import-products"),
     path("import/hesabate/sales/", views.HesabateImportSalesView.as_view(), name="import-sales"),
+    # The café's own report — drinks, hours, the app, the loyalty scheme.
+    path("reports/cafe/", views.ReportsCafeView.as_view(), name="reports-cafe"),
     path("reports/summary/", views.ReportsSummaryView.as_view(), name="reports-summary"),
     path("reports/teaser/", views.ReportsTeaserView.as_view(), name="reports-teaser"),
     path("reports/sales/summary/", views.SalesReportsSummaryView.as_view(), name="reports-sales-summary"),

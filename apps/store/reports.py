@@ -18,6 +18,7 @@ import re
 from datetime import timedelta
 from decimal import Decimal
 
+from django.conf import settings
 from django.db.models import (
     Case,
     Count,
@@ -1087,3 +1088,306 @@ def build_export_workbook(store, *, report: str, **opts):
         raise ValueError("unknown report")
 
     return wb
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The café report
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Everything above this line was written for a shop that holds stock: what is
+# priced wrong, what is expiring, what has no barcode, what is worth how much
+# on the shelf. A café holds almost no stock. It holds a MENU, and the
+# questions it has are about drinks and people:
+#
+#   what sells, what does not, and what makes the money (not the same list);
+#   when is it busy, so who is rostered when;
+#   which sizes people actually buy;
+#   how much of the till is the app, and how much of it is regulars;
+#   what the loyalty scheme costs and what it brings back.
+#
+# One response, one cache entry, because the page is one screen.
+
+
+def _cafe_window(days: int):
+    days = max(1, min(int(days or 30), 365))
+    return days, timezone.now() - timedelta(days=days)
+
+
+def cafe_summary(store_id: int, *, days: int = 30) -> dict:
+    """Everything the coffee-shop reports page shows, in one query set."""
+    from django.db.models.functions import ExtractHour, ExtractWeekDay
+
+    days, since = _cafe_window(days)
+    zero = Value(Decimal("0"), output_field=DEC)
+    sign = Case(
+        When(is_return=True, then=Value(-1)),
+        default=Value(1),
+        output_field=IntegerField(),
+    )
+    signed_total = ExpressionWrapper(F("discounted_total") * sign, output_field=DEC)
+
+    sales = models.Sale.objects.for_pharmacy(store_id).filter(created_at__gte=since)
+    items = models.SaleItem.objects.for_pharmacy(store_id).filter(
+        sale__created_at__gte=since
+    )
+
+    # ── the headline ─────────────────────────────────────────────────────
+    head = sales.aggregate(
+        revenue=Coalesce(Sum(signed_total), zero),
+        tickets=Count("id", filter=Q(is_return=False)),
+        returns=Count("id", filter=Q(is_return=True)),
+        with_customer=Count("id", filter=Q(is_return=False, customer__isnull=False)),
+    )
+    cups = items.aggregate(n=Coalesce(Sum(_signed(F("quantity"))), zero))["n"]
+    tickets = head["tickets"] or 0
+    avg_ticket = (head["revenue"] / tickets) if tickets else Decimal("0")
+    cups_per_ticket = (cups / tickets) if tickets else Decimal("0")
+
+    # ── drinks ───────────────────────────────────────────────────────────
+    # Two lists, deliberately. The drink you sell most of and the drink that
+    # earns most are usually different, and a café that only ever looks at
+    # the first one keeps promoting its cheapest cup.
+    top_by_cups = product_sales(store_id, days=days, by="qty", limit=10)
+    top_by_revenue = product_sales(store_id, days=days, by="revenue", limit=10)
+    slowest = product_sales(store_id, days=days, by="qty", direction="bottom", limit=10)
+
+    # On the menu, and sold NOTHING in the window. product_sales can only
+    # rank what appears in a sale, so a drink nobody ordered is invisible to
+    # it — which is exactly the drink worth knowing about.
+    sold_ids = set(
+        items.exclude(product_id=None).values_list("product_id", flat=True).distinct()
+    )
+    never_sold = [
+        {"product_id": p["id"], "name": p["name"], "price": str(p["price"] or 0)}
+        for p in (
+            models.Product.objects.for_pharmacy(store_id)
+            .filter(is_active=True)
+            .exclude(id__in=sold_ids)
+            .order_by("name")
+            .values("id", "name", "price")[:50]
+        )
+    ]
+
+    # Which SIZE people buy. `variant_label` is snapshotted on the line, so
+    # this survives a menu edit.
+    by_size = [
+        {
+            "label": r["variant_label"] or "بلا حجم",
+            "qty": str(r["qty"]),
+            "revenue": str(r["revenue"]),
+        }
+        for r in (
+            items.exclude(variant_label="")
+            .values("variant_label")
+            .annotate(
+                qty=Coalesce(Sum(_signed(F("quantity"))), zero),
+                revenue=Coalesce(
+                    Sum(_signed(F("quantity") * F("unit_price"))), zero
+                ),
+            )
+            .order_by("-qty")[:10]
+        )
+    ]
+
+    by_category = [
+        {
+            "name": r["category"] or "بلا تصنيف",
+            "qty": str(r["qty"]),
+            "revenue": str(r["revenue"]),
+        }
+        for r in (
+            items.values("category")
+            .annotate(
+                qty=Coalesce(Sum(_signed(F("quantity"))), zero),
+                revenue=Coalesce(
+                    Sum(_signed(F("quantity") * F("unit_price"))), zero
+                ),
+            )
+            .order_by("-revenue")[:12]
+        )
+    ]
+
+    # ── when ─────────────────────────────────────────────────────────────
+    by_hour = [
+        {"hour": r["h"], "revenue": str(r["total"]), "count": r["count"]}
+        for r in (
+            sales.annotate(h=ExtractHour("created_at"))
+            .values("h")
+            .annotate(total=Coalesce(Sum(signed_total), zero), count=Count("id"))
+            .order_by("h")
+        )
+    ]
+    # Django's ExtractWeekDay is 1=Sunday … 7=Saturday, which is already the
+    # week as it is read here.
+    WEEK = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+    by_weekday = [
+        {
+            "day": WEEK[(r["w"] - 1) % 7],
+            "index": r["w"],
+            "revenue": str(r["total"]),
+            "count": r["count"],
+        }
+        for r in (
+            sales.annotate(w=ExtractWeekDay("created_at"))
+            .values("w")
+            .annotate(total=Coalesce(Sum(signed_total), zero), count=Count("id"))
+            .order_by("w")
+        )
+    ]
+    peak_hour = max(by_hour, key=lambda r: int(r["count"]), default=None)
+    peak_day = max(by_weekday, key=lambda r: int(r["count"]), default=None)
+
+    # ── the app vs the counter ───────────────────────────────────────────
+    orders = models.Order.objects.for_pharmacy(store_id).filter(created_at__gte=since)
+    order_agg = orders.aggregate(
+        total=Count("id"),
+        collected=Count("id", filter=Q(status=models.Order.Status.COLLECTED)),
+        cancelled=Count("id", filter=Q(status=models.Order.Status.CANCELLED)),
+        open=Count(
+            "id",
+            filter=Q(
+                status__in=[
+                    models.Order.Status.PLACED,
+                    models.Order.Status.ACCEPTED,
+                    models.Order.Status.PREPARING,
+                    models.Order.Status.READY,
+                ]
+            ),
+        ),
+    )
+    app_revenue = orders.filter(
+        status=models.Order.Status.COLLECTED
+    ).aggregate(v=Coalesce(Sum("total"), zero))["v"]
+
+    # How long between "I ordered" and "here you go". The Sale is created at
+    # the moment of handover, so the gap between the two rows IS the wait —
+    # no extra timestamps needed on Order.
+    waits = [
+        (o.sale.created_at - o.created_at).total_seconds() / 60
+        for o in orders.filter(
+            status=models.Order.Status.COLLECTED, sale__isnull=False
+        ).select_related("sale")[:500]
+        if o.sale and o.sale.created_at > o.created_at
+    ]
+    waits.sort()
+    median_wait = waits[len(waits) // 2] if waits else None
+
+    # ── loyalty ──────────────────────────────────────────────────────────
+    ledger = models.BeanLedger.objects.for_pharmacy(store_id).filter(
+        created_at__gte=since
+    )
+    points = ledger.aggregate(
+        earned=Coalesce(Sum("delta", filter=Q(delta__gt=0)), Value(0)),
+        spent=Coalesce(Sum("delta", filter=Q(delta__lt=0)), Value(0)),
+        redemptions=Count(
+            "id", filter=Q(reason=models.BeanLedger.Reason.REDEEM)
+        ),
+    )
+    per_ils = int(getattr(settings, "POINTS_PER_ILS", 10)) or 10
+    earned = int(points["earned"] or 0)
+    spent = -int(points["spent"] or 0)
+
+    customers = models.Customer.objects.for_pharmacy(store_id)
+    new_customers = customers.filter(created_at__gte=since).count()
+    # A "regular" is somebody who came more than once IN THIS WINDOW. Anything
+    # cleverer needs a definition the shop has not given us.
+    visit_counts = (
+        sales.filter(is_return=False, customer__isnull=False)
+        .values("customer_id")
+        .annotate(n=Count("id"))
+    )
+    seen = list(visit_counts)
+    repeat = sum(1 for r in seen if r["n"] > 1)
+    identified = len(seen)
+
+    top_customers = [
+        {
+            "id": r["customer_id"],
+            "name": r["customer__name"] or "—",
+            "total": str(r["total"]),
+            "visits": r["visits"],
+        }
+        for r in (
+            sales.filter(customer__isnull=False)
+            .values("customer_id", "customer__name")
+            .annotate(
+                total=Coalesce(Sum(signed_total), zero),
+                visits=Count("id", filter=Q(is_return=False)),
+            )
+            .order_by("-total")[:10]
+        )
+    ]
+
+    return {
+        "days": days,
+        "headline": {
+            "revenue": str(head["revenue"]),
+            "tickets": tickets,
+            "returns": head["returns"],
+            "cups": str(cups),
+            "avg_ticket": str(avg_ticket.quantize(Decimal("0.01"))),
+            "cups_per_ticket": str(cups_per_ticket.quantize(Decimal("0.01"))),
+            "identified_share": (
+                round(100 * (head["with_customer"] or 0) / tickets) if tickets else 0
+            ),
+            "peak_hour": peak_hour["hour"] if peak_hour else None,
+            "peak_day": peak_day["day"] if peak_day else None,
+        },
+        "drinks": {
+            "top_by_cups": top_by_cups,
+            "top_by_revenue": top_by_revenue,
+            "slowest": slowest,
+            "never_sold": never_sold,
+            "by_size": by_size,
+            "by_category": by_category,
+        },
+        "when": {
+            "by_day": sales_by_day(store_id, days=days),
+            "by_hour": by_hour,
+            "by_weekday": by_weekday,
+        },
+        "app": {
+            "orders": order_agg["total"],
+            "collected": order_agg["collected"],
+            "cancelled": order_agg["cancelled"],
+            "open": order_agg["open"],
+            "cancel_rate": (
+                round(100 * order_agg["cancelled"] / order_agg["total"])
+                if order_agg["total"]
+                else 0
+            ),
+            "revenue": str(app_revenue),
+            "share": (
+                round(100 * float(app_revenue) / float(head["revenue"]))
+                if head["revenue"]
+                else 0
+            ),
+            "median_wait_min": round(median_wait, 1) if median_wait is not None else None,
+        },
+        "loyalty": {
+            "earned": earned,
+            "spent": spent,
+            "redemptions": points["redemptions"],
+            "earned_value": str((Decimal(earned) / per_ils).quantize(Decimal("0.01"))),
+            "spent_value": str((Decimal(spent) / per_ils).quantize(Decimal("0.01"))),
+            # The liability: points sitting in customers' hands, in shekels.
+            # NOT windowed — a balance is a balance, whatever period is on
+            # screen — which is exactly why an owner asks about it.
+            "outstanding": str(
+                (
+                    Decimal(
+                        models.LoyaltyProfile.objects.for_pharmacy(store_id).aggregate(
+                            n=Coalesce(Sum("beans"), Value(0))
+                        )["n"]
+                        or 0
+                    )
+                    / per_ils
+                ).quantize(Decimal("0.01"))
+            ),
+            "new_customers": new_customers,
+            "identified": identified,
+            "repeat": repeat,
+            "repeat_rate": round(100 * repeat / identified) if identified else 0,
+            "top_customers": top_customers,
+        },
+    }

@@ -1739,6 +1739,32 @@ class SalesReportsSummaryView(ReportsBaseView):
         return Response(data)
 
 
+class ReportsCafeView(ReportsBaseView):
+    """GET /reports/cafe/?days=30 — the coffee shop's own report.
+
+    Not behind the "sales_reports" module. The inventory report and the deep
+    sales report are add-ons for a shop that has stock and staff to analyse;
+    this one is the ONLY report a café has, and putting the only report behind
+    an upsell is how a product gets described as a demo.
+
+    Cached five minutes per (store, days), like every other report: this is
+    analytics, not the till.
+    """
+
+    TTL = 5 * 60
+
+    def get(self, request):
+        from . import reports
+
+        days = self._int(request.query_params.get("days"), 30, 1, 365)
+        key = f"reports:cafe:v1:{self.store_id}:{days}"
+        data = cache.get(key)
+        if data is None:
+            data = reports.cafe_summary(self.store_id, days=days)
+            cache.set(key, data, self.TTL)
+        return Response(data)
+
+
 class SalesReportsExportView(ReportsBaseView):
     """GET /reports/sales/export/?days=30 — the sales report as xlsx."""
 
@@ -4522,7 +4548,19 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     # keeps one card per order.
     search_fields = ["customer__name", "items__name"]
     ordering = ["-created_at"]
-    http_method_names = ["get", "patch", "head", "options"]
+    # POST has to be here or DRF rejects the request in dispatch(), BEFORE it
+    # ever looks at the router: `advance` is a POST action, and leaving "post"
+    # out of this list 405'd every attempt to accept an order. The list was
+    # meant to say "the till cannot CREATE an order" — which is true and still
+    # enforced, one method down, where it can be said precisely instead of by
+    # blocking a verb the viewset genuinely needs.
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "الطلب يُنشأ من التطبيق، لا من الكاونتر"},
+            status=405,
+        )
 
     def get_queryset(self):
         return (
