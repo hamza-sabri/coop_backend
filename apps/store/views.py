@@ -4532,6 +4532,44 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             .distinct()
         )
 
+    #: The four states that mean somebody is waiting. Everything else is
+    #: finished business and belongs in history.
+    OPEN_STATUSES = (
+        models.Order.Status.PLACED,
+        models.Order.Status.ACCEPTED,
+        models.Order.Status.PREPARING,
+        models.Order.Status.READY,
+    )
+
+    @action(detail=False, methods=["get"])
+    def live(self, request):
+        """GET /orders/live/ — the counter's board, and only the board.
+
+        Polled from every admin page (that is what the sidebar badge is), so it
+        has to be cheap: one query on the (store, status, created_at) index,
+        oldest first, no pagination and no count query. The alternative the
+        admin used before this — fetch fifty orders of any age and filter them
+        in the browser — grew with the shop's history and got slower every week
+        it ran.
+
+        `pending` is the number nobody has ACCEPTED yet. That, not the length of
+        the list, is the number worth putting on a badge: an order being made is
+        already someone's job; an order nobody has looked at is not.
+        """
+        qs = (
+            self.get_queryset()
+            .filter(status__in=self.OPEN_STATUSES)
+            .order_by("created_at")
+        )
+        rows = list(qs)
+        return Response({
+            "results": serializers.OrderSerializer(rows, many=True).data,
+            "pending": sum(
+                1 for o in rows if o.status == models.Order.Status.PLACED
+            ),
+            "open": len(rows),
+        })
+
     @action(detail=True, methods=["post"])
     def advance(self, request, pk=None):
         """POST {status} — move an order one legal step."""
@@ -4543,7 +4581,12 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 status=400,
             )
         order.status = target
-        order.save(update_fields=["status", "updated_at"])
+        fields = ["status", "updated_at"]
+        if target == models.Order.Status.CANCELLED:
+            reason = (request.data.get("reason") or "").strip()[:255]
+            order.cancelled_reason = reason or "أُلغي من الكاونتر"
+            fields.append("cancelled_reason")
+        order.save(update_fields=fields)
 
         # Points are minted when the drink is HANDED OVER, not when the order
         # is placed. An order that is cancelled must never have already paid
@@ -4570,6 +4613,17 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                     points_service.balance_of(order.customer),
                     f"من الطلب #{order.pk}",
                 )
+
+        # A cancellation must give the points back. The customer's own cancel
+        # path has always done this; the counter's did not, so a barista
+        # cancelling an order the customer had paid points towards took the
+        # points and gave nothing back. Same idempotency key as the app's
+        # cancel, so the two can race and the balance still moves once.
+        if target == models.Order.Status.CANCELLED and order.beans_spent:
+            points_service.refund_spend(
+                order.store, order.customer, int(order.beans_spent or 0),
+                source="طلب", source_id=order.pk,
+            )
 
         # The customer is waiting on exactly this. Record + push, after commit.
         push_service.notify_order_status(order)
