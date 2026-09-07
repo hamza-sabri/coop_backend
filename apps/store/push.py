@@ -35,23 +35,72 @@ _creds_lock = threading.Lock()
 _creds = None
 
 
-def _credentials():
-    """Service-account credentials, parsed once and refreshed in place.
+def credentials_info() -> dict | None:
+    """The service-account JSON as a dict, however it was pasted in.
 
-    FIREBASE_CREDENTIALS holds the service-account JSON itself rather than a
-    path, because the deployment is a container and a secret that has to exist
-    as a file on disk is a secret that ends up baked into an image.
+    FIREBASE_CREDENTIALS holds the JSON itself rather than a path, because the
+    deployment is a container and a secret that has to exist as a file on disk
+    is a secret that ends up baked into an image. That is the right trade, but
+    it puts a 1,700-character value with embedded `\n` escapes through a web
+    form, and the two ways that goes wrong are both silent:
+
+    *   the panel (or a shell, or a copy-paste through an editor) converts the
+        `\n` escapes in `private_key` into REAL line breaks, which is no longer
+        valid JSON — and often truncates the value at the first one;
+    *   nothing is pasted at all and the variable stays empty.
+
+    So three shapes are accepted. Base64 is the one to prefer, because it has
+    no newlines, no quotes and no backslashes and therefore nothing left for a
+    form to mangle: `base64 -w0 service-account.json`.
     """
-    global _creds
-    raw = getattr(settings, "FIREBASE_CREDENTIALS", "") or ""
+    raw = (getattr(settings, "FIREBASE_CREDENTIALS", "") or "").strip()
     if not raw:
+        return None
+
+    # 1. base64 of the JSON — the shape that survives any input box.
+    if not raw.startswith("{"):
+        import base64
+
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode("utf-8").strip()
+            if decoded.startswith("{"):
+                raw = decoded
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2. the JSON as-is.
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. the JSON with the PEM's newline escapes eaten. Repaired rather than
+    #    rejected: the value is still complete, it is only mis-quoted, and
+    #    telling an owner to re-paste a key he already pasted correctly-looking
+    #    is not a fix he can act on.
+    import re
+
+    m = re.search(r'("private_key"\s*:\s*")(.*?)("\s*[,}])', raw, re.S)
+    if m:
+        body = m.group(2).replace("\r", "").replace("\n", "\\n")
+        try:
+            return json.loads(raw[: m.start(2)] + body + raw[m.end(2) :])
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _credentials():
+    """Service-account credentials, parsed once and refreshed in place."""
+    global _creds
+    info = credentials_info()
+    if info is None:
         return None
     with _creds_lock:
         if _creds is None:
             try:
                 from google.oauth2 import service_account
 
-                info = json.loads(raw)
                 _creds = service_account.Credentials.from_service_account_info(
                     info, scopes=[FCM_SCOPE]
                 )

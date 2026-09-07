@@ -1,0 +1,48 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+
+<div style="max-width:760px">
+  <p style="font-size:15px">
+    هذا يمسح <b>تاريخ</b> المتجر <b>{{ store.name }}</b> (<code>{{ store.slug }}</code>)
+    ويُبقي المنيو كما هو. لا يمكن التراجع.
+  </p>
+
+  <h3>سيُحذف</h3>
+  <table style="width:100%;margin-bottom:18px">
+    <thead><tr><th style="text-align:start">الجدول</th><th style="text-align:start">عدد الصفوف</th></tr></thead>
+    <tbody>
+      {% for label, n in counts %}
+        <tr><td>{{ label }}</td><td><b>{{ n }}</b></td></tr>
+      {% endfor %}
+      <tr>
+        <td>حسابات فايربيس للزبائن</td>
+        <td><b>{{ firebase_count }}</b>
+          {% if not firebase_ready %}
+            <span style="color:#b45309"> — فايربيس غير مضبوط، لن تُحذف</span>
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>لن يُمس</h3>
+  <ul>{% for k in kept %}<li>{{ k }}</li>{% endfor %}</ul>
+
+  {% if error %}<p style="color:#b91c1c"><b>{{ error }}</b></p>{% endif %}
+
+  <form method="post" style="margin-top:22px;padding:16px;border:2px solid #b91c1c;border-radius:10px">
+    {% csrf_token %}
+    <p>للتأكيد، اكتب اسم المتجر بالضبط: <code>{{ store.slug }}</code></p>
+    <input type="text" name="confirm" autocomplete="off" style="width:260px;padding:8px" />
+    <label style="display:block;margin-top:12px">
+      <input type="checkbox" name="firebase" value="1" checked />
+      احذف أيضاً حسابات الزبائن من فايربيس (ليتمكنوا من التسجيل من جديد)
+    </label>
+    <p style="margin-top:16px">
+      <button type="submit" class="deletelink" style="padding:9px 18px">امسح كل شيء عدا المنيو</button>
+      <a href="../" style="margin-inline-start:14px">إلغاء</a>
+    </p>
+  </form>
+</div>
+{% endblock %}

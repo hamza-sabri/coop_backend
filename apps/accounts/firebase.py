@@ -326,11 +326,55 @@ class FirebaseSyncView(View):
         # whether a service account is present, never what is in it.
         from apps.store import push as push_service
 
+        # WHY it is not configured, not just that it is not. A boolean sends
+        # whoever set the variable back to the dashboard to stare at it; the
+        # three failures below look identical from there and have completely
+        # different fixes. None of this reveals the key: only its length, and
+        # whether the JSON parsed.
+        raw = (getattr(settings, "FIREBASE_CREDENTIALS", "") or "").strip()
+        info = push_service.credentials_info()
+        if not raw:
+            push_detail = "FIREBASE_CREDENTIALS is empty or not set on this container"
+        elif info is None:
+            push_detail = (
+                "FIREBASE_CREDENTIALS is set but could not be read as the "
+                "service-account JSON, even after repairing the private_key "
+                "line breaks. Paste it base64-encoded instead: "
+                "base64 -w0 service-account.json"
+            )
+        else:
+            missing = [
+                k for k in ("type", "project_id", "private_key", "client_email")
+                if not info.get(k)
+            ]
+            key = str(info.get("private_key", ""))
+            if missing:
+                push_detail = f"JSON parsed but missing keys: {', '.join(missing)}"
+            elif not key.strip().startswith("-----BEGIN"):
+                push_detail = "private_key does not start with -----BEGIN"
+            elif "-----END" not in key:
+                push_detail = (
+                    "private_key is truncated — it has no -----END line. The "
+                    "value was probably cut at the first line break; paste it "
+                    "base64-encoded instead: base64 -w0 service-account.json"
+                )
+            elif info.get("project_id") != project_id():
+                push_detail = (
+                    f"service account is for project {info.get('project_id')!r}, "
+                    f"but FIREBASE_PROJECT_ID is {project_id()!r}"
+                )
+            elif not push_service._credentials():
+                push_detail = "JSON is valid but google-auth refused it (see logs)"
+            else:
+                push_detail = "ok"
+
         return JsonResponse({
             "enabled": firebase_enabled(),
             "project_id": project_id(),
             "store_slug": getattr(settings, "CLERK_STORE_SLUG", ""),
             "push_configured": bool(push_service._credentials()),
+            "push_detail": push_detail,
+            "credentials_length": len(raw),
         })
 
     def post(self, request, *args, **kwargs):

@@ -1,5 +1,10 @@
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
+from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
+from django.urls import path, reverse
+from django.utils.html import format_html
 
 from . import models
 from .modules import MODULES
@@ -139,16 +144,98 @@ class PharmacyAdmin(admin.ModelAdmin):
         "is_active",
         "modules_display",
         "created_at",
+        "reset_link",
     ]
     list_filter = ["plan", "is_active"]
     search_fields = ["name", "slug"]
     prepopulated_fields = {"slug": ["name"]}
+    readonly_fields = ["reset_link"]
 
     @admin.display(description="Extra modules")
     def modules_display(self, obj):
         if obj.enabled_modules:
             return ", ".join(obj.enabled_modules)
         return "all (legacy)" if obj.plan_id is None else "—"
+
+    # -- start fresh ------------------------------------------------------
+    # A destructive button lives on the object it destroys, not on a global
+    # "danger" page: there is then no version of the click that can hit the
+    # wrong shop.
+
+    @admin.display(description="تصفير")
+    def reset_link(self, obj):
+        # The add form renders readonly fields too, and an unsaved store has
+        # no pk to reverse against.
+        if obj is None or obj.pk is None:
+            return "—"
+        return format_html(
+            '<a class="button" style="background:#b91c1c;color:#fff" href="{}">'
+            "امسح التاريخ</a>",
+            reverse("admin:store_store_reset", args=[obj.pk]),
+        )
+
+    def get_urls(self):
+        return [
+            path(
+                "<int:pk>/reset/",
+                self.admin_site.admin_view(self.reset_view),
+                name="store_store_reset",
+            ),
+            *super().get_urls(),
+        ]
+
+    def reset_view(self, request, pk):
+        from django.conf import settings
+
+        from . import reset as reset_service
+
+        # Superuser only. `admin_view` already requires staff; a shop reset is
+        # not a thing an employee with an admin login should be able to do.
+        if not request.user.is_superuser:
+            raise PermissionDenied
+
+        store = get_object_or_404(models.Store, pk=pk)
+        uids = reset_service.firebase_uids(store)
+        # Actually parsed, not merely present: a mangled variable would
+        # otherwise promise a deletion the confirmation page cannot deliver.
+        from apps.store import push as push_service
+
+        ready = bool(
+            push_service.credentials_info()
+            and (getattr(settings, "FIREBASE_PROJECT_ID", "") or "").strip()
+        )
+        error = ""
+
+        if request.method == "POST":
+            typed = (request.POST.get("confirm") or "").strip()
+            if typed != store.slug:
+                error = "الاسم المكتوب لا يطابق اسم المتجر. لم يُحذف شيء."
+            else:
+                done = reset_service.wipe_database(store)
+                rows = sum(n for _, n in done)
+                messages.success(
+                    request,
+                    f"تم تصفير «{store.name}»: حُذف {rows} صف. المنيو والموظفون كما هم.",
+                )
+                if request.POST.get("firebase"):
+                    n, note = reset_service.delete_firebase_users(uids)
+                    (messages.success if n else messages.warning)(request, note)
+                return redirect("admin:store_store_changelist")
+
+        return TemplateResponse(
+            request,
+            "admin/store/reset.html",
+            {
+                **self.admin_site.each_context(request),
+                "title": f"تصفير المتجر: {store.name}",
+                "store": store,
+                "counts": reset_service.preview(store),
+                "kept": reset_service.KEPT,
+                "firebase_count": len(uids),
+                "firebase_ready": ready,
+                "error": error,
+            },
+        )
 
 
 @admin.register(models.Category)
