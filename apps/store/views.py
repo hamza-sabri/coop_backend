@@ -1776,36 +1776,6 @@ class CafeReportsBase(ReportsBaseView):
     ]
 
 
-class ReportsTodayView(CafeReportsBase):
-    """GET /reports/today/ — cashing up.
-
-    NOT cached. Every other report on this API is analytics and five minutes
-    of staleness is the right trade; this one is read while the owner is
-    counting the drawer, and a figure that is five minutes old is a figure
-    that disagrees with the money in his hand.
-
-    The day boundary is BUSINESS_DAY_START_HOUR (midnight by default). A café
-    that starts trading at 1pm and closes at 2am can set it to 4 and every
-    "today" figure follows, without touching this view.
-    """
-
-    def get(self, request):
-        from datetime import timedelta as _td
-
-        from . import reports
-
-        start = business_day_start()
-        end = start + _td(days=1)
-        return Response(
-            reports.today_summary(
-                self.store_id,
-                start=start,
-                end=end,
-                prev_start=start - _td(days=1),
-            )
-        )
-
-
 class ReportsCafeView(CafeReportsBase):
     """GET /reports/cafe/?days=30 — the coffee shop's own report.
 
