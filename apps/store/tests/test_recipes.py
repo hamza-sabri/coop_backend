@@ -370,3 +370,117 @@ class StaffAccessTests(RecipeBase):
         self.assertTrue(me["is_owner"])
         self.assertEqual(su.staff_name, "الإدارة")
         self.assertEqual(self.staff.get("/api/v1/staff/").status_code, 403)
+
+
+class ExpenseKindTests(RecipeBase):
+    def setUp(self):
+        super().setUp()
+        finance.ensure_default_categories(self.store.pk)
+        self.cats = {c.key: c for c in models.ExpenseCategory.objects.for_pharmacy(self.store)}
+
+    def test_a_salary_names_its_employee(self):
+        url = "/api/v1/recurring-expenses/"
+        r = self.api.post(url, {"category": self.cats["salaries"].pk, "amount": "1800", "start_month": "2026-09-01"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("staff", str(r.json()))
+        r = self.api.post(url, {"category": self.cats["salaries"].pk, "amount": "1800", "start_month": "2026-09-01",
+                                "staff": self.emp.pk}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        body = r.json().get("data", r.json())
+        self.assertEqual(body["staff_name"], self.emp.staff_name)
+        self.assertEqual(body["category_key"], "salaries")
+
+    def test_no_staff_from_another_shop_or_the_platform(self):
+        other = models.Store.objects.create(name="X", slug="x")
+        outsider = User.objects.create_user(username="out", password="x", store=other, role="employee")
+        root = User.objects.create_user(username="root2", password="x", store=self.store, is_superuser=True)
+        for who in (outsider, root):
+            r = self.api.post("/api/v1/expenses/", {"category": self.cats["salaries"].pk, "amount": "100",
+                                                    "period": "2026-09-01", "staff": who.pk}, format="json")
+            self.assertEqual(r.status_code, 400)
+
+    def test_a_bill_keeps_its_payee_and_drops_a_stray_staff(self):
+        r = self.api.post("/api/v1/expenses/", {"category": self.cats["maintenance"].pk, "amount": "250",
+                                                "period": "2026-09-01", "note": "تصليح ماكينة القهوة",
+                                                "payee": "أبو سامر", "staff": self.emp.pk}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        body = r.json().get("data", r.json())
+        self.assertEqual(body["payee"], "أبو سامر")
+        self.assertIsNone(body["staff"])
+
+    def test_month_view_has_a_six_month_trend(self):
+        r = self.api.get("/api/v1/expenses/month/?month=2026-09")
+        d = r.json().get("data", r.json())
+        self.assertEqual(len(d["trend"]), 6)
+        self.assertEqual(d["trend"][-1]["month"], "2026-09")
+
+
+class SalesSummaryTests(RecipeBase):
+    def test_summary_counts_the_filtered_list_and_hides_money_from_staff(self):
+        self.sell(1)
+        self.sell(2)
+        day = finance.today().isoformat()
+        r = self.api.get(f"/api/v1/sales/summary/?day_from={day}&day_to={day}")
+        d = r.json().get("data", r.json())
+        self.assertEqual(d["count"], 2)
+        self.assertEqual(d["total"], "36.00")
+        s = self.staff.get(f"/api/v1/sales/summary/?day_from={day}&day_to={day}").json()
+        s = s.get("data", s)
+        self.assertEqual(s["count"], 2)
+        self.assertNotIn("total", s)
+        # yesterday is empty
+        y = (finance.today() - __import__("datetime").timedelta(days=1)).isoformat()
+        r = self.api.get(f"/api/v1/sales/summary/?day_from={y}&day_to={y}").json()
+        self.assertEqual(r.get("data", r)["count"], 0)
+
+
+class CustomerTableTests(RecipeBase):
+    def test_table_lists_visits_and_hides_spend_from_staff(self):
+        c = models.Customer.objects.create(store=self.store, name="دانا", phone="0590000002")
+        models.Customer.objects.create(store=self.store, name="بلا زيارات", phone="0590000003")
+        self.sell(1, customer=c.pk)
+        self.sell(1, customer=c.pk)
+        d = self.api.get("/api/v1/customers/table/").json()
+        d = d.get("data", d)
+        row = next(r for r in d["results"] if r["id"] == c.pk)
+        self.assertEqual(row["visits"], 2)
+        self.assertEqual(row["spent"], "24.00")
+        self.assertEqual(row["status"], "new")
+        self.assertEqual(row["days_since"], 0)
+        none = next(r for r in d["results"] if r["name"] == "بلا زيارات")
+        self.assertEqual(none["status"], "no_visits")
+        s = self.staff.get("/api/v1/customers/table/").json()
+        s = s.get("data", s)
+        self.assertNotIn("spent", s["results"][0])
+
+
+class StaffBoardTests(RecipeBase):
+    def test_board_has_month_sales_and_the_salary_from_expenses(self):
+        finance.ensure_default_categories(self.store.pk)
+        salaries = models.ExpenseCategory.objects.for_pharmacy(self.store).get(key="salaries")
+        month = finance.today().replace(day=1)
+        models.RecurringExpense.objects.create(
+            store=self.store, category=salaries, amount=D("1800"), staff=self.emp, start_month=month
+        )
+        self.sell(2, client=self.staff)
+        root = User.objects.create_user(username="root3", password="x", store=self.store, is_superuser=True)
+        d = self.api.get("/api/v1/staff/board/").json()
+        d = d.get("data", d)
+        rows = {r["username"]: r for r in d["results"]}
+        self.assertNotIn(root.username, rows)
+        self.assertEqual(rows["e"]["month_sales"], 1)
+        self.assertEqual(rows["e"]["month_total"], "24.00")
+        self.assertEqual(rows["e"]["salary"], "1800.00")
+        self.assertIsNotNone(rows["e"]["last_sale"])
+        self.assertIsNone(rows["o"]["salary"])
+        self.assertEqual(self.staff.get("/api/v1/staff/board/").status_code, 403)
+
+
+class CustomersReportAvatarTests(RecipeBase):
+    def test_top_customers_carry_a_servable_photo(self):
+        c = models.Customer.objects.create(store=self.store, name="ريم", phone="0590000009", avatar="b2://faces/r.jpg")
+        self.sell(1, customer=c.pk)
+        with mock.patch("apps.store.breakdowns.resolve_stored_url", side_effect=lambda v: f"https://signed/{v[5:]}" if v else ""):
+            today = finance.today()
+            d = breakdowns.customers_report(self.store.pk, today, today)
+        self.assertEqual(d["top"][0]["avatar"], "https://signed/faces/r.jpg")

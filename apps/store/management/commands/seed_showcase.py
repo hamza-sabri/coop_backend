@@ -95,9 +95,12 @@ MATERIALS = [
     ("بودرة بروتين", "جاف", "kg", 1, 120, 150, 500, 365),
 ]
 
-EXPENSES_RECURRING = [("rent", "إيجار المحل", Decimal("3000")),
-                      ("salaries", "رواتب الموظفين", Decimal("7500")),
-                      ("internet", "إنترنت", Decimal("150"))]
+#: key, name, amount, who is paid. Salaries are per employee (see _expenses).
+EXPENSES_RECURRING = [("rent", "إيجار المحل", Decimal("3000"), "صاحب العقار"),
+                      ("internet", "إنترنت", Decimal("150"), "شركة الاتصالات")]
+SALARIES = [Decimal("1900"), Decimal("1800"), Decimal("2000"), Decimal("1850")]
+PAYEES = {"electricity": "شركة الكهرباء", "water": "البلدية", "maintenance": "فني الماكينات",
+          "marketing": "إعلان انستغرام", "other": "محل التنظيف"}
 EXPENSES_MONTHLY = [("electricity", 1100, 1600), ("water", 90, 180)]
 EXPENSES_SOMETIMES = [("maintenance", 150, 700, 0.6), ("marketing", 200, 600, 0.7),
                       ("other", 50, 250, 0.8)]
@@ -723,11 +726,22 @@ class Command(BaseCommand):
         cats = {c.key: c for c in models.ExpenseCategory.objects.for_pharmacy(self.store) if c.key}
         first = start.replace(day=1)
         n = 0
-        for key, name, amount in EXPENSES_RECURRING:
+        for key, name, amount, payee in EXPENSES_RECURRING:
             if key not in cats:
                 continue
             r = models.RecurringExpense.objects.create(
-                store=self.store, category=cats[key], name=name, amount=amount, start_month=first
+                store=self.store, category=cats[key], name=name, amount=amount, payee=payee, start_month=first
+            )
+            self.mark.add(r)
+            n += 1
+        # A monthly salary for each demo employee, by name.
+        crew = [u for team in self.on_shift.values() for u in team]
+        for u, amount in zip(crew, SALARIES):
+            if "salaries" not in cats:
+                break
+            r = models.RecurringExpense.objects.create(
+                store=self.store, category=cats["salaries"], name=f"راتب {u.staff_name}", amount=amount,
+                staff=u, start_month=first,
             )
             self.mark.add(r)
             n += 1
@@ -739,7 +753,7 @@ class Command(BaseCommand):
                 e = models.Expense.objects.create(
                     store=self.store, category=cats[key], amount=Decimal(self.rng.randint(lo, hi)),
                     period=month, paid_on=(month + timedelta(days=35)).replace(day=self.rng.randint(3, 12)),
-                    note="فاتورة الشهر",
+                    note="فاتورة الشهر", payee=PAYEES.get(key, ""),
                 )
                 self.mark.add(e)
                 n += 1
@@ -751,6 +765,7 @@ class Command(BaseCommand):
                     period=month, paid_on=min(today, month + timedelta(days=self.rng.randint(2, 25))),
                     note={"maintenance": "صيانة ماكينة القهوة", "marketing": "إعلان ممول",
                           "other": "مستلزمات تنظيف"}[key],
+                    payee=PAYEES.get(key, ""),
                 )
                 self.mark.add(e)
                 n += 1

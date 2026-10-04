@@ -8,7 +8,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import (
-    Case, Count, DecimalField, F, Max, Q, Sum, Value, When,
+    Case, Count, DecimalField, F, Max, OuterRef, Q, Subquery, Sum, Value, When,
 )
 from django.db.models.functions import Coalesce, TruncDate, TruncMonth
 from django.utils import timezone
@@ -46,6 +46,22 @@ class SaleFilter(django_filters.FilterSet):
 
     created_after = django_filters.DateFilter(field_name="created_at", lookup_expr="date__gte")
     created_before = django_filters.DateFilter(field_name="created_at", lookup_expr="date__lte")
+    #: Business days (the 4am cutover): 01:30 belongs to last night, exactly as
+    #: on the P&L and the period chips — so a chip's count and its list agree.
+    day_from = django_filters.DateFilter(method="filter_day_from")
+    day_to = django_filters.DateFilter(method="filter_day_to")
+
+    def filter_day_from(self, queryset, name, value):
+        from apps.store import finance
+
+        lo, _ = finance.bounds(value, value)
+        return queryset.filter(created_at__gte=lo)
+
+    def filter_day_to(self, queryset, name, value):
+        from apps.store import finance
+
+        _, hi = finance.bounds(value, value)
+        return queryset.filter(created_at__lt=hi)
     min_price = django_filters.NumberFilter(field_name="discounted_total", lookup_expr="gte")
     max_price = django_filters.NumberFilter(field_name="discounted_total", lookup_expr="lte")
     created_by = django_filters.NumberFilter(field_name="created_by")
@@ -109,6 +125,8 @@ class SaleFilter(django_filters.FilterSet):
             "created_by",
             "created_after",
             "created_before",
+            "day_from",
+            "day_to",
             "min_price",
             "max_price",
             "item",
@@ -293,7 +311,7 @@ def request_pharmacy_id(request):
         request._pharmacy_active = active
     if not active:
         raise PermissionDenied(
-            "اشتراك الصيدلية موقوف. يرجى التواصل مع الدعم لتفعيله."
+            "اشتراك المقهى موقوف. يرجى التواصل مع الدعم لتفعيله."
         )
     return pid
 
@@ -2495,6 +2513,60 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         invalidate_customers_quick_cache(self.store_id)
 
     @action(detail=False, methods=["get"])
+    def table(self, request):
+        """GET /customers/table/ — every customer with what the customers
+        page shows and filters by: visits, last visit (business day), status
+        and (owner only) spend. One query; the page searches and sorts it."""
+        from apps.core.uploads import resolve_stored_url
+        from apps.store import finance
+        from apps.store.cafe_api import _is_owner
+
+        from apps.store.breakdowns import customer_status
+
+        owner = _is_owner(request.user)
+        money = DecimalField(max_digits=18, decimal_places=2)
+        today = finance.today()
+        lo30, _ = finance.bounds(today - timedelta(days=29), today)
+        sales = models.Sale.objects.for_pharmacy(self.store_id).filter(customer_id=OuterRef("pk"), is_return=False)
+        per = sales.values("customer_id")
+        qs = (
+            models.Customer.objects.for_pharmacy(self.store_id)
+            .annotate(
+                visits=Coalesce(Subquery(per.annotate(n=Count("id")).values("n")[:1]), 0),
+                visits_30=Coalesce(Subquery(per.filter(created_at__gte=lo30).annotate(n=Count("id")).values("n")[:1]), 0),
+                first_at=Subquery(sales.order_by("created_at").values("created_at")[:1]),
+                last_at=Subquery(sales.order_by("-created_at").values("created_at")[:1]),
+                spent=Coalesce(
+                    Subquery(per.annotate(t=Sum("discounted_total")).values("t")[:1]),
+                    Decimal("0.00"),
+                    output_field=money,
+                ),
+                beans=Coalesce(F("loyalty__beans"), 0),
+            )
+            .values("id", "name", "phone", "avatar", "gender", "clerk_id", "created_at",
+                    "visits", "visits_30", "first_at", "last_at", "spent", "beans")
+        )
+        rows = []
+        for c in qs:
+            last = finance.business_date(c["last_at"]) if c["last_at"] else None
+            first = finance.business_date(c["first_at"]) if c["first_at"] else None
+            joined = finance.business_date(c["created_at"])
+            since = (today - last).days if last else None
+            gap = ((last - first).days / (c["visits"] - 1)) if first and last and c["visits"] > 1 else None
+            row = {
+                "id": c["id"], "name": c["name"], "phone": c["phone"] or "",
+                "avatar": resolve_stored_url(c["avatar"]), "gender": c["gender"],
+                "app": bool(c["clerk_id"]), "visits": c["visits"], "visits_30d": c["visits_30"],
+                "last_visit": last.isoformat() if last else None, "days_since": since,
+                "joined": joined.isoformat(), "points": int(c["beans"] or 0),
+                "status": customer_status(c["visits"], (today - joined).days, since, c["visits_30"], gap),
+            }
+            if owner:
+                row["spent"] = str(Decimal(c["spent"]).quantize(Decimal("0.01")))
+            rows.append(row)
+        return Response({"results": rows, "count": len(rows)})
+
+    @action(detail=False, methods=["get"])
     def quick(self, request):
         """Every customer in one Redis-cached payload for instant client-side
         search/filtering (POS pickers). `GET /api/v1/customers/quick/`."""
@@ -3485,6 +3557,27 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         return Response({"deleted": deleted})
 
     @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """GET /sales/summary/?<the list's own filters> — how many invoices the
+        current filter shows, and (owner only) what they took: returns count
+        negative and refunds handed back come off, as everywhere else."""
+        from apps.store.cafe_api import _is_owner
+
+        qs = self.filter_queryset(self.get_queryset())
+        out = {"count": qs.count()}
+        if _is_owner(request.user):
+            money = DecimalField(max_digits=18, decimal_places=2)
+            signed = Case(When(is_return=True, then=-F("discounted_total")), default=F("discounted_total"), output_field=money)
+            total = qs.aggregate(n=Coalesce(Sum(signed, output_field=money), Decimal("0.00"), output_field=money))["n"]
+            back = (
+                models.SaleReturn.objects.for_pharmacy(self.store_id)
+                .filter(sale__in=qs.values("pk"))
+                .aggregate(n=Coalesce(Sum("refund_amount"), Decimal("0.00"), output_field=money))["n"]
+            )
+            out["total"] = str((total - back).quantize(Decimal("0.01")))
+        return Response(out)
+
+    @action(detail=False, methods=["get"])
     def stats(self, request):
         """Sales analytics in one Redis-cached call.
 
@@ -3783,7 +3876,7 @@ class HesabateImportView(APIView):
                         "row": 0,
                         "message": (
                             f"⚠️ {renames} صنف موجود سيتغيّر اسمه بهذا الملف — "
-                            "تأكد أن الملف يعود لنفس الصيدلية وأنه أحدث نسخة"
+                            "تأكد أن الملف يعود لنفس المتجر وأنه أحدث نسخة"
                         ),
                     })
                 preview = {
@@ -3920,6 +4013,50 @@ class StaffViewSet(viewsets.ModelViewSet):
             # sees, edits and deactivates their people — never ours.
             qs = qs.filter(is_superuser=False)
         return qs.order_by("-role", "username")
+
+    @action(detail=False, methods=["get"], url_path="board")
+    def board(self, request):
+        """GET /staff/board/ — the staff list with what an owner asks about
+        each person: their photo, what they rang up this month, when they last
+        sold, and the monthly salary booked for them in المصاريف."""
+        from apps.core.uploads import resolve_stored_url
+        from apps.store import finance
+
+        pid = request_pharmacy_id(request)
+        users = list(self.get_queryset())
+        today = finance.today()
+        month = today.replace(day=1)
+        lo, hi = finance.bounds(month, today)
+        sales = (
+            models.Sale.objects.for_pharmacy(pid)
+            .filter(created_by_id__in=[u.pk for u in users], is_return=False)
+        )
+        month_rows = {
+            r["created_by_id"]: r
+            for r in sales.filter(created_at__gte=lo, created_at__lt=hi)
+            .values("created_by_id")
+            .annotate(n=Count("id"), total=Sum("discounted_total"))
+        }
+        last = dict(sales.values("created_by_id").annotate(t=Max("created_at")).values_list("created_by_id", "t"))
+        salary = {}
+        for r in models.RecurringExpense.objects.for_pharmacy(pid).filter(staff_id__in=[u.pk for u in users]):
+            if r.active_in(month):
+                salary[r.staff_id] = salary.get(r.staff_id, Decimal("0")) + r.amount
+        ser = self.get_serializer(users, many=True)
+        out = []
+        for u, data in zip(users, ser.data):
+            m = month_rows.get(u.pk) or {}
+            out.append(
+                {
+                    **data,
+                    "photo": resolve_stored_url(getattr(u, "profile_image_url", "") or ""),
+                    "month_sales": m.get("n", 0),
+                    "month_total": str((m.get("total") or Decimal("0")).quantize(Decimal("0.01"))),
+                    "last_sale": last[u.pk].isoformat() if last.get(u.pk) else None,
+                    "salary": str(salary[u.pk].quantize(Decimal("0.01"))) if u.pk in salary else None,
+                }
+            )
+        return Response({"month": month.isoformat(), "results": out})
 
     @action(detail=True, methods=["post"], url_path="reset-password")
     def reset_password(self, request, pk=None):

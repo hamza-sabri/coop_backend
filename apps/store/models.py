@@ -2108,6 +2108,13 @@ class Expense(TimeStampedModel):
     period = models.DateField(db_index=True)
     paid_on = models.DateField(null=True, blank=True)
     note = models.CharField(max_length=255, blank=True)
+    #: Whose salary / bonus / advance this is (salaries only).
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    #: Who was paid: the landlord, the electrician, the print shop.
+    payee = models.CharField(max_length=120, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
         on_delete=models.SET_NULL,
@@ -2154,6 +2161,12 @@ class RecurringExpense(TimeStampedModel):
         max_digits=12, decimal_places=2,
         validators=[MinValueValidator(Decimal("0.00"))],
     )
+    #: A monthly salary belongs to one person.
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    payee = models.CharField(max_length=120, blank=True)
     start_month = models.DateField()
     end_month = models.DateField(null=True, blank=True)
 

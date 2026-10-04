@@ -121,7 +121,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         store = getattr(self.user, "store", None)
         if store is not None and not store.is_active:
             raise exceptions.AuthenticationFailed(
-                "اشتراك الصيدلية موقوف. يرجى التواصل مع الدعم لتفعيله.",
+                "اشتراك المقهى موقوف. يرجى التواصل مع الدعم لتفعيله.",
                 code="pharmacy_suspended",
             )
 
@@ -196,7 +196,7 @@ class StaffSerializer(serializers.ModelSerializer):
         extra = granted - tier
         if extra:
             raise serializers.ValidationError(
-                "وحدات غير متاحة ضمن باقة الصيدلية: " + "، ".join(sorted(extra))
+                "صفحات غير متاحة في باقتك: " + "، ".join(sorted(extra))
             )
         return sorted(granted)
 
@@ -213,7 +213,7 @@ class StaffSerializer(serializers.ModelSerializer):
                 clash = clash.exclude(pk=self.instance.pk)
             if clash.exists():
                 raise serializers.ValidationError(
-                    {"username": "اسم المستخدم مستخدم بالفعل في هذه الصيدلية."}
+                    {"username": "اسم الدخول هذا مستخدم لحساب آخر — اختر غيره."}
                 )
 
         # A brand-new account needs a password; edits may omit it (unchanged).
@@ -239,7 +239,7 @@ class StaffSerializer(serializers.ModelSerializer):
                 )
                 if not others:
                     raise serializers.ValidationError(
-                        "لا يمكن إزالة صلاحية آخر مالك للصيدلية."
+                        "يجب أن يبقى مالك واحد على الأقل — لا يمكن إزالة آخر مالك."
                     )
             if target.pk == request.user.pk and not new_active:
                 raise serializers.ValidationError("لا يمكنك تعطيل حسابك الخاص.")

@@ -20,6 +20,7 @@ from decimal import Decimal
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Max, Q, Sum, Value
 from django.db.models.functions import Coalesce, ExtractHour
 
+from apps.core.uploads import resolve_stored_url
 from apps.store import finance, models
 from apps.store import points as points_service
 
@@ -329,7 +330,7 @@ def customers_report(store_id, start: date, end: date) -> dict:
         .values_list("customer_id", flat=True)
     )
     top = list(
-        named.values("customer_id", "customer__name", "customer__phone")
+        named.values("customer_id", "customer__name", "customer__phone", "customer__avatar")
         .annotate(spend=Sum("discounted_total"), visits=Count("id"), last=Max("created_at"))
         .order_by("-spend")[:15]
     )
@@ -361,6 +362,7 @@ def customers_report(store_id, start: date, end: date) -> dict:
         "top": [
             {
                 "id": t["customer_id"], "name": t["customer__name"], "phone": t["customer__phone"] or "",
+                "avatar": resolve_stored_url(t["customer__avatar"]),
                 "spend": str(q2(t["spend"])), "visits": t["visits"],
                 "avg": str(q2(Decimal(t["spend"]) / t["visits"])) if t["visits"] else "0.00",
                 "last": t["last"].isoformat() if t["last"] else None,
@@ -637,6 +639,25 @@ def inventory_insights(store_id, start: date, end: date) -> dict:
 WEEKS = 12
 
 
+def customer_status(visits, age_days, since_last, visits_30d, gap) -> str:
+    """One word for where a customer stands — the same on the list and on
+    the profile. In order of precedence:
+      no_visits — never bought
+      new       — joined in the last fortnight and not yet a regular
+      fading    — gone three times their usual gap (and at least two weeks)
+      regular   — eight or more visits in the last 30 days
+      active    — everyone else who comes"""
+    if not visits:
+        return "no_visits"
+    if age_days < 14 and visits_30d < 8:
+        return "new"
+    if since_last is not None and since_last > max(14, (gap or 7) * 3):
+        return "fading"
+    if visits_30d >= 8:
+        return "regular"
+    return "active"
+
+
 def customer_profile(store_id, customer, *, owner: bool) -> dict:
     """What a café wants to know about one regular, from every sale they ever
     made (voided sales are deleted; returns are their own rows).
@@ -662,17 +683,7 @@ def customer_profile(store_id, customer, *, owner: bool) -> dict:
     joined = finance.business_date(customer.created_at)
     recent = sum(1 for d in days if (today - d).days < 30)
 
-    # One word for where they stand, in this order of precedence.
-    if not visits:
-        status = "no_visits"
-    elif (today - joined).days < 14 and recent < 8:
-        status = "new"
-    elif gap is not None and since_last is not None and since_last > max(14, gap * 3):
-        status = "fading"
-    elif recent >= 8:
-        status = "regular"
-    else:
-        status = "active"
+    status = customer_status(visits, (today - joined).days, since_last, recent, gap)
 
     # The last 12 weeks, Saturday-first like the rest of the app.
     week0 = today - timedelta(days=(today.weekday() - finance.WEEK_START) % 7) - timedelta(weeks=WEEKS - 1)

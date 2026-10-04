@@ -118,7 +118,7 @@ class OwnerRequired(BasePermission):
     can never reach them, regardless of module grants.
     """
 
-    message = "هذه الميزة متاحة لمالك الصيدلية فقط. تواصل مع الإدارة لتفعيلها."
+    message = "هذه الصفحة للمالك فقط."
 
     def has_permission(self, request, view):
         user = request.user

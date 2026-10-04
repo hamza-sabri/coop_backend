@@ -537,14 +537,47 @@ class _CategoryField(serializers.PrimaryKeyRelatedField):
         return models.ExpenseCategory.objects.for_pharmacy(request_pharmacy_id(request))
 
 
-class ExpenseSerializer(serializers.ModelSerializer):
+class _StaffField(serializers.PrimaryKeyRelatedField):
+    """A person on THIS shop's staff — never another shop's, never a
+    platform superuser."""
+
+    def get_queryset(self):
+        from apps.accounts.models import User
+
+        request = self.context.get("request")
+        return User.objects.filter(store_id=request_pharmacy_id(request), is_superuser=False)
+
+
+class _ExpenseKindMixin(serializers.Serializer):
+    """What every expense form shares: who it was for, and the rule that a
+    salary always names its person."""
+
+    category_key = serializers.CharField(source="category.key", read_only=True)
+    staff = _StaffField(required=False, allow_null=True)
+    staff_name = serializers.SerializerMethodField()
+
+    def get_staff_name(self, obj) -> str:
+        return obj.staff.staff_name if getattr(obj, "staff_id", None) else ""
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        cat = attrs.get("category", getattr(self.instance, "category", None))
+        staff = attrs.get("staff", getattr(self.instance, "staff", None))
+        if cat is not None and cat.key == "salaries" and staff is None:
+            raise serializers.ValidationError({"staff": "اختر الموظف صاحب الراتب."})
+        if cat is not None and cat.key != "salaries" and "staff" in attrs:
+            attrs["staff"] = None
+        return attrs
+
+
+class ExpenseSerializer(_ExpenseKindMixin, serializers.ModelSerializer):
     category = _CategoryField()
     category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta:
         model = models.Expense
-        fields = ["id", "category", "category_name", "amount", "period", "paid_on",
-                  "note", "client_uuid", "created_at"]
+        fields = ["id", "category", "category_name", "category_key", "amount", "period", "paid_on",
+                  "note", "staff", "staff_name", "payee", "client_uuid", "created_at"]
         read_only_fields = ["id", "created_at"]
 
 
@@ -584,13 +617,25 @@ class ExpenseViewSet(OwnerOnlyMixin, StoreScopedMixin, viewsets.ModelViewSet):
         first = first.replace(day=1)
         last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
         finance.ensure_default_categories(self.store_id)
-        one_off = models.Expense.objects.for_pharmacy(self.store_id).filter(period=first).select_related("category")
-        recurring = [r for r in models.RecurringExpense.objects.for_pharmacy(self.store_id).select_related("category") if r.active_in(first)]
+        one_off = models.Expense.objects.for_pharmacy(self.store_id).filter(period=first).select_related("category", "staff")
+        recurring = [
+            r for r in models.RecurringExpense.objects.for_pharmacy(self.store_id).select_related("category", "staff")
+            if r.active_in(first)
+        ]
         by_cat = finance.opex(self.store_id, first, last)
         prev_last = first - timedelta(days=1)
         prev_first = prev_last.replace(day=1)
         prev = finance.opex(self.store_id, prev_first, prev_last)
+        # The last six months, oldest first, for the trend chart.
+        trend = []
+        m0 = first
+        for _ in range(6):
+            end = m0.replace(day=calendar.monthrange(m0.year, m0.month)[1])
+            trend.append({"month": m0.strftime("%Y-%m"), "total": str(finance.opex(self.store_id, m0, end)["total"])})
+            m0 = (m0 - timedelta(days=1)).replace(day=1)
+        trend.reverse()
         return Response({
+            "trend": trend,
             "month": first.strftime("%Y-%m"),
             "expenses": ExpenseSerializer(one_off, many=True, context={"request": request}).data,
             "recurring": RecurringExpenseSerializer(recurring, many=True, context={"request": request}).data,
@@ -600,16 +645,18 @@ class ExpenseViewSet(OwnerOnlyMixin, StoreScopedMixin, viewsets.ModelViewSet):
         })
 
 
-class RecurringExpenseSerializer(serializers.ModelSerializer):
+class RecurringExpenseSerializer(_ExpenseKindMixin, serializers.ModelSerializer):
     category = _CategoryField()
     category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta:
         model = models.RecurringExpense
-        fields = ["id", "category", "category_name", "name", "amount", "start_month", "end_month"]
+        fields = ["id", "category", "category_name", "category_key", "name", "amount", "staff", "staff_name",
+                  "payee", "start_month", "end_month"]
         read_only_fields = ["id"]
 
     def validate(self, attrs):
+        attrs = super().validate(attrs)
         s = attrs.get("start_month", getattr(self.instance, "start_month", None))
         e = attrs.get("end_month", getattr(self.instance, "end_month", None))
         if s and e and e.replace(day=1) < s.replace(day=1):
