@@ -2524,6 +2524,16 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         cache.set(customers_quick_key(self.store_id), payload, CUSTOMERS_QUICK_TTL)
         return Response(payload)
 
+    @action(detail=True, methods=["get"], url_path="profile")
+    def profile(self, request, pk=None):
+        """GET /customers/{id}/profile/ — visits, habits, favourites, the last
+        12 weeks. Spend and average bill only for the owner."""
+        from apps.store import breakdowns
+        from apps.store.cafe_api import _is_owner
+
+        customer = self.get_object()
+        return Response(breakdowns.customer_profile(self.store_id, customer, owner=_is_owner(request.user)))
+
     @action(detail=True, methods=["get", "post"], url_path="points")
     def points(self, request, pk=None):
         """One customer's loyalty standing, and a way to move it by hand.
@@ -3020,6 +3030,12 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             if locked is None:
                 return  # someone else voided it while we waited for the lock
 
+            # Ingredients back on the shelf, as a reversing move: the history
+            # keeps both the sale's use and its cancellation.
+            from apps.store import recipes
+
+            recipes.reverse_sale(locked, reason="إلغاء فاتورة", user=self.request.user)
+
             if self._restores_stock(locked) and tracks_menu_stock():
                 # sale → put stock back, return → take it out again
                 delta = -1 if locked.is_return else 1
@@ -3426,7 +3442,10 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         var_delta = defaultdict(Decimal)
         sale_ids, debt_ids = [], []
         with transaction.atomic():
+            from apps.store import recipes
+
             for sale in qs.iterator(chunk_size=1000):
+                recipes.reverse_sale(sale, reason="حذف فواتير", user=request.user)
                 # sale → put stock back, return → take it out again.
                 # Migrated Shamel invoices never took stock out, so crediting
                 # them back would invent stock — see _restores_stock.

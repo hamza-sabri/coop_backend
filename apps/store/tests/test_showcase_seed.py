@@ -26,7 +26,7 @@ class ShowcaseTests(TestCase):
         self.real_sale = models.Sale.objects.create(store=self.store, total=Decimal("15"), discounted_total=Decimal("15"))
 
     def seed(self):
-        call_command("seed_showcase", "--days", "8", "--customers", "6", stdout=StringIO())
+        call_command("seed_showcase", "--days", "8", "--customers", "6", "--sales", "300", "--no-pictures", stdout=StringIO())
 
     def test_seed_then_purge_leaves_only_what_was_real(self):
         self.seed()
@@ -64,3 +64,21 @@ class ShowcaseTests(TestCase):
         n = models.Sale.objects.for_pharmacy(self.store).count()
         call_command("purge_showcase", stdout=StringIO())
         self.assertEqual(models.Sale.objects.for_pharmacy(self.store).count(), n)
+
+
+class StoreResolutionTests(TestCase):
+    def test_uses_the_deployments_shop_then_refuses_to_guess(self):
+        from django.test import override_settings
+
+        from apps.store.management.commands._store import resolve_store
+
+        coop = models.Store.objects.create(name="كوب", slug="coop")
+        with override_settings(CLERK_STORE_SLUG="coop"):
+            self.assertEqual(resolve_store(None), coop)
+        models.Store.objects.create(name="آخر", slug="other")
+        with override_settings(CLERK_STORE_SLUG="missing"):
+            with self.assertRaises(CommandError):
+                resolve_store(None)
+        self.assertEqual(resolve_store("other").slug, "other")
+        with self.assertRaises(CommandError):
+            resolve_store("koup")

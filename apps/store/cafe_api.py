@@ -161,6 +161,11 @@ def record_return(sale, data, user) -> models.SaleReturn:
             if found:
                 return found
             raise
+        if row.refund_amount == 0:
+            # A remake: a second drink was made, from the shelf.
+            from apps.store import recipes
+
+            recipes.consume_remake(row, user=user)
     return row
 
 
@@ -173,6 +178,10 @@ class InventoryItemSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer)
     unit_label = serializers.CharField(source="get_unit_display", read_only=True)
     purchase_unit_label = serializers.CharField(source="get_purchase_unit_display", read_only=True)
     state = serializers.SerializerMethodField()
+    #: Base units used per day (sales, remakes, waste) over the last 14 days,
+    #: and how many days the shelf lasts at that rate. Null = not used lately.
+    daily_use = serializers.SerializerMethodField()
+    days_left = serializers.SerializerMethodField()
     #: Opening stock on create, in the PURCHASE unit. Write-only convenience so
     #: "I have 2 crates now" is one form, not a form and a count.
     opening_stock = serializers.DecimalField(
@@ -186,13 +195,35 @@ class InventoryItemSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer)
             "purchase_qty", "purchase_unit", "purchase_unit_label", "purchase_cost",
             "unit_cost", "stock", "stock_value", "reorder_level", "expiry_date",
             "supplier", "notes", "is_active", "client_uuid", "state",
+            "daily_use", "days_left",
             "opening_stock", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "unit", "unit_cost", "stock", "created_at", "updated_at"]
 
+    def _use(self, obj):
+        usage = self.context.get("usage")
+        if usage is None:
+            from apps.store.breakdowns import daily_use
+
+            usage = self.context["usage"] = daily_use(obj.store_id)
+        return usage.get(obj.pk)
+
+    def get_daily_use(self, obj):
+        u = self._use(obj)
+        return str(u.quantize(Decimal("0.001"))) if u else None
+
+    def get_days_left(self, obj):
+        from apps.store.breakdowns import days_left
+
+        return days_left(obj.stock, self._use(obj))
+
     def get_state(self, obj) -> list:
         tags = []
         stock = Decimal(obj.stock or 0)
+        if stock < 0:
+            # Sales took more than the system knew was there: a delivery not
+            # booked, or a count due. The till never blocks on it.
+            tags.append("negative")
         if stock <= 0:
             tags.append("out")
         elif obj.reorder_level and stock <= Decimal(obj.reorder_level):
@@ -215,7 +246,7 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
-    OWNER_ACTIONS = {"destroy", "purchase"}
+    OWNER_ACTIONS = {"destroy", "purchase", "insights"}
 
     def get_permissions(self):
         perms = super().get_permissions()
@@ -247,12 +278,35 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         item = serializer.save(store_id=self.store_id)
         if opening:
             base = models.InventoryItem.to_base(opening, item.purchase_unit)
-            _apply_move(item, models.StockMove.Kind.COUNT, base, self.request.user,
+            # An opening balance is not a count difference: ADJUST, so the
+            # P&L never reads the first stock on the shelf as a gain.
+            _apply_move(item, models.StockMove.Kind.ADJUST, base, self.request.user,
                         reason="رصيد افتتاحي")
 
     def perform_update(self, serializer):
         serializer.validated_data.pop("opening_stock", None)
         serializer.save()
+
+    def perform_destroy(self, instance):
+        used = list(
+            instance.recipe_lines.select_related("product").values_list("product__name", flat=True).distinct()[:5]
+        )
+        if used:
+            raise ValidationError(
+                {"detail": "الصنف داخل في وصفة: " + "، ".join(used) + ". احذفه من الوصفات أولاً، أو أوقفه بدل حذفه."}
+            )
+        instance.delete()
+
+    @action(detail=True, methods=["get"])
+    def ledger(self, request, pk=None):
+        """The item's statement for a period — the answer to "where did it
+        go?". Opening + every movement = closing, exactly; "used by sales" is
+        broken down by drink. ?period=day|week|month&date= like the reports."""
+        from apps.store import breakdowns
+
+        item = self.get_object()
+        r = finance.resolve_range(request.query_params)
+        return Response(breakdowns.item_ledger(item, r["start"], r["end"], owner=_is_owner(request.user)))
 
     @action(detail=True, methods=["get"])
     def moves(self, request, pk=None):
@@ -359,6 +413,14 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         return Response({"moves": len(done)})
 
     @action(detail=False, methods=["get"])
+    def insights(self, request):
+        """GET /inventory-items/insights/?period=… — the overview tab."""
+        from apps.store import breakdowns
+
+        r = finance.resolve_range(request.query_params)
+        return Response(breakdowns.inventory_insights(self.store_id, r["start"], r["end"]))
+
+    @action(detail=False, methods=["get"])
     def summary(self, request):
         owner = _is_owner(request.user)
         qs = models.InventoryItem.objects.for_pharmacy(self.store_id).filter(is_active=True)
@@ -403,6 +465,7 @@ def _move_json(m, owner: bool) -> dict:
         "id": m.pk, "item": m.item_id, "kind": m.kind, "kind_label": m.get_kind_display(),
         "quantity": str(m.quantity), "stock_after": str(m.stock_after),
         "reason": m.reason, "note": m.note,
+        "sale": m.sale_id, "receipt_code": m.receipt_code, "product_name": m.product_name,
         "created_by_name": (m.created_by.get_full_name() or m.created_by.get_username()) if m.created_by_id else "",
         "created_at": m.created_at.isoformat(),
     }
@@ -763,3 +826,163 @@ class ReportsReturnsView(_RangeReport):
 
         r = self.range()
         return Response(breakdowns.returns_report(self.store_id, r["start"], r["end"]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Inventory categories (the dropdown on an item)
+# ═══════════════════════════════════════════════════════════════════════════
+DEFAULT_INV_CATEGORIES = ["قهوة", "ألبان", "سيرب", "فواكه", "جاف", "تغليف", "تنظيف"]
+
+
+class InventoryCategorySerializer(serializers.ModelSerializer):
+    items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.InventoryCategory
+        fields = ["id", "name", "position", "items"]
+
+    def get_items(self, obj) -> int:
+        return models.InventoryItem.objects.for_pharmacy(obj.store_id).filter(category=obj.name).count()
+
+    def validate_name(self, v):
+        v = (v or "").strip()
+        if not v:
+            raise serializers.ValidationError("أدخل اسم التصنيف.")
+        return v[:80]
+
+
+class InventoryCategoryViewSet(OwnerWritesMixin, StoreScopedMixin, viewsets.ModelViewSet):
+    """The category list behind the dropdown. Seeded on first read from the
+    categories items already use, plus a short default list. Renaming one
+    renames it on every item; deleting one in use is refused."""
+
+    queryset = models.InventoryCategory.objects.unscoped()
+    serializer_class = InventoryCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def list(self, request, *args, **kwargs):
+        sid = self.store_id
+        qs = models.InventoryCategory.objects.for_pharmacy(sid)
+        if not qs.exists():
+            used = list(
+                models.InventoryItem.objects.for_pharmacy(sid).exclude(category="")
+                .values_list("category", flat=True).distinct()
+            )
+            names = list(dict.fromkeys([*used, *DEFAULT_INV_CATEGORIES]))
+            for i, n in enumerate(names):
+                models.InventoryCategory.objects.get_or_create(store_id=sid, name=n, defaults={"position": i})
+        return super().list(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        found = models.InventoryCategory.objects.for_pharmacy(self.store_id).filter(name=name).first()
+        if found:
+            serializer.instance = found
+            return
+        serializer.save(store_id=self.store_id)
+
+    def perform_update(self, serializer):
+        old = serializer.instance.name
+        cat = serializer.save()
+        if cat.name != old:
+            models.InventoryItem.objects.for_pharmacy(self.store_id).filter(category=old).update(category=cat.name)
+
+    def perform_destroy(self, instance):
+        if models.InventoryItem.objects.for_pharmacy(self.store_id).filter(category=instance.name).exists():
+            raise ValidationError({"detail": "التصنيف مستخدم لأصناف — انقلها لتصنيف آخر أولاً."})
+        instance.delete()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Recipes (owner)
+# ═══════════════════════════════════════════════════════════════════════════
+class ProductRecipeView(APIView):
+    """GET /products/<id>/recipe/ — every version of the drink's recipe.
+    PUT  {variant: null|id, lines: [{item, quantity, unit}]} — replaces ONE
+    version. `quantity` is in `unit` (piece, g, kg, ml, l) and stored in the
+    ingredient's base unit; an empty `lines` on a size = use the drink's."""
+
+    permission_classes = [permissions.IsAuthenticated, OwnerRequired, StoreResolved]
+
+    def _product(self, request, pk):
+        p = models.Product.objects.for_pharmacy(request_pharmacy_id(request)).filter(pk=pk).first()
+        if p is None:
+            raise ValidationError({"detail": "غير موجود."})
+        return p
+
+    def get(self, request, pk):
+        from apps.store import recipes
+
+        p = self._product(request, pk)
+        return Response(recipes.recipe_payload(p.store_id, p))
+
+    def _rows(self, p, raw, who=""):
+        """Validate one version's lines → [(item, base_qty, unit)]. Nothing is
+        written until every version in the request has passed."""
+        if not isinstance(raw, list):
+            raise ValidationError({"lines": "أرسل قائمة المكونات."})
+        pre = f"{who}: " if who else ""
+        items = {
+            i.pk: i
+            for i in models.InventoryItem.objects.for_pharmacy(p.store_id).filter(
+                pk__in=[r.get("item") for r in raw if isinstance(r, dict)]
+            )
+        }
+        rows = []
+        for n, r in enumerate(raw):
+            item = items.get(r.get("item")) if isinstance(r, dict) else None
+            if item is None:
+                raise ValidationError({"lines": f"{pre}المكوّن {n + 1}: اختر صنفاً من المخزون."})
+            unit = r.get("unit") or item.unit
+            if models.InventoryItem.base_unit_of(unit) != item.unit:
+                raise ValidationError({"lines": f"{pre}{item.name}: وحدة لا تناسب الصنف."})
+            try:
+                qty = Decimal(str(r.get("quantity")))
+            except Exception:
+                raise ValidationError({"lines": f"{pre}{item.name}: كمية غير صحيحة."})
+            base = models.InventoryItem.to_base(qty, unit).quantize(Decimal("0.001"))
+            if base <= 0:
+                raise ValidationError({"lines": f"{pre}{item.name}: الكمية يجب أن تكون أكبر من صفر."})
+            rows.append((item, base, unit))
+        if len({r[0].pk for r in rows}) != len(rows):
+            raise ValidationError({"lines": f"{pre}صنف مكرر — اجمع الكمية في سطر واحد."})
+        return rows
+
+    def put(self, request, pk):
+        """Either one version ({variant, lines}) or several at once
+        ({versions: [{variant, lines}, …]}) — the drink form saves the drink
+        and every size together, all or nothing."""
+        from apps.store import recipes
+
+        p = self._product(request, pk)
+        if "versions" in request.data:
+            versions = request.data.get("versions")
+            if not isinstance(versions, list):
+                raise ValidationError({"versions": "أرسل قائمة."})
+        else:
+            versions = [{"variant": request.data.get("variant"), "lines": request.data.get("lines") or []}]
+        labels = dict(p.variants.values_list("pk", "label"))
+        plan, seen = [], set()
+        for v in versions:
+            variant_id = (v or {}).get("variant") or None
+            if variant_id and variant_id not in labels:
+                raise ValidationError({"variant": "هذا الحجم ليس لهذا المشروب."})
+            if variant_id in seen:
+                raise ValidationError({"variant": "نفس الحجم مرتين."})
+            seen.add(variant_id)
+            who = labels.get(variant_id, "") if variant_id else ""
+            plan.append((variant_id, self._rows(p, (v or {}).get("lines") or [], who)))
+        with transaction.atomic():
+            for variant_id, rows in plan:
+                models.RecipeLine.objects.for_pharmacy(p.store_id).filter(product=p, variant_id=variant_id).delete()
+                for i, (item, base, unit) in enumerate(rows):
+                    models.RecipeLine.objects.create(
+                        store_id=p.store_id, product=p, variant_id=variant_id, item=item,
+                        quantity=base, display_unit=unit, position=i,
+                    )
+        from apps.store.views import invalidate_pos_catalog_cache
+
+        invalidate_pos_catalog_cache(p.store_id)
+        return Response(recipes.recipe_payload(p.store_id, p))

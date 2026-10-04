@@ -1257,6 +1257,12 @@ class SaleSerializer(serializers.ModelSerializer):
                 # that retry safe) so a bad row can never reach the ledger.
                 if sale.payment_method == "debt" and not sale.debt_id:
                     raise SaleDebtMirrorError(sale.pk, sale.customer_id)
+
+                # Ingredients out of stock, in the same transaction as the
+                # sale: a sale that fails leaves the shelf untouched.
+                from apps.store import recipes
+
+                recipes.consume_sale(sale, user=validated_data.get("created_by"))
         except IntegrityError:
             # Two concurrent requests raced on the same client_uuid — the loser
             # returns the winner's sale rather than erroring.
@@ -1428,6 +1434,12 @@ class SaleSerializer(serializers.ModelSerializer):
                     }
                 )
 
+            # 0. Put back what the version being replaced took from stock,
+            #    while its lines still exist (so the reversal names them).
+            from apps.store import recipes
+
+            recipes.reverse_sale(sale, reason="تعديل فاتورة", user=editor)
+
             # 1. Keep the version being replaced, whole, before anything moves.
             version = models.SaleRevision.unguarded.filter(sale=sale).count() + 1
             models.SaleRevision.objects.create(
@@ -1482,6 +1494,9 @@ class SaleSerializer(serializers.ModelSerializer):
 
             if sale.payment_method == "debt" and not sale.debt_id:
                 raise SaleDebtMirrorError(sale.pk, sale.customer_id)
+
+            # …and take what the corrected version is made of.
+            recipes.consume_sale(sale, user=editor)
 
             # Read it back before it is serialised. `sale` was loaded with its
             # items prefetched and this method deleted every one of them, so

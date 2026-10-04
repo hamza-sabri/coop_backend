@@ -251,6 +251,7 @@ def _sales_block(store_id, lo, hi, shift):
     ).aggregate(
         refunds=Coalesce(Sum("refund_amount"), Value(ZERO, output_field=DEC)),
         written_off=Coalesce(Sum("cost_written_off"), Value(ZERO, output_field=DEC)),
+        remake_cost=Coalesce(Sum("cost_written_off", filter=Q(refund_amount=0)), Value(ZERO, output_field=DEC)),
         n=Count("id"),
         remakes=Count("id", filter=Q(refund_amount=0)),
     )
@@ -281,7 +282,25 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
         shift,
     )
     waste = q2(waste_qs.aggregate(n=Coalesce(Sum("total_cost"), Value(ZERO, output_field=DEC)))["n"])
-    gross_profit = q2(net_revenue - cogs - waste)
+    # A remake is a second drink: its cost is on top of the first one's.
+    remakes = q2(ret["remake_cost"])
+    # Stock counts. Only for ingredients that are in a recipe: their use by
+    # sales is recorded, so what a count finds missing is a real loss (or a
+    # gain). For anything else (napkins, cleaning) a count is just how much
+    # was used, and its cost is not a P&L line.
+    recipe_items = models.RecipeLine.objects.for_pharmacy(store_id).values("item_id")
+    counts = _in_shift(
+        models.StockMove.objects.for_pharmacy(store_id).filter(
+            kind=models.StockMove.Kind.COUNT, created_at__gte=lo, created_at__lt=hi,
+            item_id__in=recipe_items,
+        ),
+        shift,
+    )
+    shrink = ZERO
+    for m in counts.values("quantity", "unit_cost"):
+        shrink -= Decimal(m["quantity"]) * Decimal(m["unit_cost"])
+    shrink = q2(shrink)
+    gross_profit = q2(net_revenue - cogs - waste - remakes - shrink)
 
     # Days actually traded so far: a month view on the 10th prorates ten days
     # of rent, not thirty-one, or every month looks like a loss until the end.
@@ -306,6 +325,8 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
             "net_revenue": str(net_revenue),
             "cogs": str(cogs),
             "waste": str(waste),
+            "remakes": str(remakes),
+            "count_shortfall": str(shrink),
             "gross_profit": str(gross_profit),
         },
         "kpis": {
@@ -431,6 +452,22 @@ def _series(store_id, start: date, end: date, shift) -> list:
         shift,
     ).values("created_at", "total_cost"):
         cost[business_date(w["created_at"])] += Decimal(w["total_cost"] or 0)
+    # Remakes and recipe-item count differences, the same as the statement.
+    for r in _in_shift(
+        models.SaleReturn.objects.for_pharmacy(store_id).filter(
+            created_at__gte=lo, created_at__lt=hi, refund_amount=0
+        ),
+        shift,
+    ).values("created_at", "cost_written_off"):
+        cost[business_date(r["created_at"])] += Decimal(r["cost_written_off"] or 0)
+    for c in _in_shift(
+        models.StockMove.objects.for_pharmacy(store_id).filter(
+            kind=models.StockMove.Kind.COUNT, created_at__gte=lo, created_at__lt=hi,
+            item_id__in=models.RecipeLine.objects.for_pharmacy(store_id).values("item_id"),
+        ),
+        shift,
+    ).values("created_at", "quantity", "unit_cost"):
+        cost[business_date(c["created_at"])] -= Decimal(c["quantity"]) * Decimal(c["unit_cost"])
 
     last = min(end, today())
     month_cost: dict[date, Decimal] = {}

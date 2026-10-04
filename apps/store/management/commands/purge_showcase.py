@@ -2,7 +2,7 @@
 
     python manage.py purge_showcase              # show what would go, touch nothing
     python manage.py purge_showcase --yes        # delete it
-    python manage.py purge_showcase --store koup --yes
+    python manage.py purge_showcase --store coop --yes
 
 Works from the DemoMark registry, never from guesses ("customers named like a
 demo", "sales before a date"): a real sale rung during the demo period, a real
@@ -26,6 +26,7 @@ ORDER = [
     ("store.SaleReturn", "المرتجعات"),
     ("store.Sale", "الفواتير"),
     ("store.Customer", "الزبائن"),
+    ("store.RecipeLine", "سطور الوصفات"),
     ("store.InventoryItem", "أصناف المخزون (وحركاتها)"),
     ("store.Expense", "المصاريف"),
     ("store.RecurringExpense", "المصاريف الشهرية الثابتة"),
@@ -48,18 +49,23 @@ class Command(BaseCommand):
     help = "Delete showcase data created by seed_showcase (dry run unless --yes)."
 
     def add_arguments(self, parser):
-        parser.add_argument("--store", default="koup")
+        parser.add_argument("--store", default=None, help="store slug (default: this deployment's shop)")
         parser.add_argument("--yes", action="store_true", help="actually delete")
 
     def handle(self, *args, **o):
-        store = models.Store.objects.filter(slug=o["store"]).first()
-        if store is None:
-            raise CommandError(f"no store with slug {o['store']!r}")
+        from apps.store.management.commands._store import resolve_store
+
+        store = resolve_store(o["store"])
         marks = models.DemoMark.objects.for_pharmacy(store)
         by_model = defaultdict(list)
         restore = defaultdict(list)
+        files = []
         for m in marks.values("model", "object_pk", "restore"):
-            if m["model"].startswith("cost:"):
+            if m["model"] == "file:storage":
+                key = (m["restore"] or {}).get("key")
+                if key:
+                    files.append(key)
+            elif m["model"].startswith("cost:"):
                 restore[m["model"]].append((m["object_pk"], m["restore"] or {}))
             else:
                 by_model[m["model"]].append(m["object_pk"])
@@ -72,6 +78,7 @@ class Command(BaseCommand):
             self.stdout.write(f"  {name}: {len(by_model.get(label, []))}")
         for key, _, name in RESTORES:
             self.stdout.write(f"  {name} تعود لقيمتها السابقة: {len(restore.get(key, []))}")
+        self.stdout.write(f"  الصور: {len(files)}")
         if not o["yes"]:
             self.stdout.write(self.style.WARNING("dry run — add --yes to delete"))
             return
@@ -82,6 +89,14 @@ class Command(BaseCommand):
                 if not ids:
                     continue
                 model = _model(label)
+                if label == "store.InventoryItem":
+                    # A recipe line the owner added on a showcase ingredient
+                    # would block the delete (PROTECT); the ingredient is
+                    # going, so its lines go with it — said out loud.
+                    extra = models.RecipeLine.unguarded.filter(store_id=store.pk, item_id__in=ids)
+                    if extra.exists():
+                        self.stdout.write(f"  removing {extra.count()} recipe lines that use showcase ingredients")
+                        extra.delete()
                 qs = model._base_manager.filter(pk__in=ids)
                 if label == "accounts.User":
                     qs = qs.filter(store=store)
@@ -98,6 +113,20 @@ class Command(BaseCommand):
                         filt["product__store_id"] = store.pk
                     model._base_manager.filter(**filt).update(cost=Decimal(prev.get("cost") or "0"))
             marks.delete()
+
+        # Pictures last, once the rows that pointed at them are gone. A file
+        # that is already missing is not an error.
+        from django.core.files.storage import default_storage
+
+        gone = 0
+        for key in files:
+            try:
+                default_storage.delete(key)
+                gone += 1
+            except Exception:
+                pass
+        if files:
+            self.stdout.write(f"  deleted pictures: {gone}")
 
         from apps.store.views import (
             invalidate_customers_quick_cache, invalidate_reports_cache,

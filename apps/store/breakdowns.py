@@ -412,3 +412,328 @@ def returns_report(store_id, start: date, end: date) -> dict:
         "by_item": by_item,
         "latest": latest,
     }
+
+
+# ── one raw material's statement ─────────────────────────────────────────
+KIND_ORDER = ["purchase", "sale", "remake", "waste", "count", "adjust"]
+
+
+def item_ledger(item, start: date, end: date, *, owner: bool) -> dict:
+    """Opening + movements = closing, for one InventoryItem over business days.
+
+    Every change to stock is a StockMove, and an item starts at zero, so the
+    opening is simply the sum of everything before the window and the closing
+    the sum through it — no stored running total is trusted. `consistent`
+    says whether the item's stock right now equals the sum of ALL its moves.
+    """
+    lo, hi = finance.bounds(start, end)
+    moves = models.StockMove.objects.for_pharmacy(item.store_id).filter(item=item)
+    zero = Value(ZERO, output_field=DEC)
+    opening = moves.filter(created_at__lt=lo).aggregate(n=Coalesce(Sum("quantity"), zero))["n"]
+    window = moves.filter(created_at__gte=lo, created_at__lt=hi)
+    by_kind = {
+        r["kind"]: r
+        for r in window.values("kind").annotate(
+            qty=Coalesce(Sum("quantity"), zero), cost=Coalesce(Sum("total_cost"), zero), n=Count("id")
+        )
+    }
+    labels = dict(models.StockMove.Kind.choices)
+    rows = []
+    for k in KIND_ORDER:
+        r = by_kind.get(k)
+        if not r:
+            continue
+        row = {"kind": k, "label": labels[k], "quantity": str(r["qty"]), "moves": r["n"]}
+        if owner:
+            row["cost"] = str(q2(r["cost"]))
+        rows.append(row)
+    change = sum((Decimal(r["qty"]) for r in by_kind.values()), ZERO)
+    closing = Decimal(opening) + change
+    all_sum = moves.aggregate(n=Coalesce(Sum("quantity"), zero))["n"]
+
+    used_by = [
+        {
+            "product_id": r["product_id"],
+            "name": r["product_name"] or "—",
+            "quantity": str(-Decimal(r["net"])),
+            "receipts": r["receipts"],
+        }
+        for r in window.filter(kind__in=["sale", "remake"])
+        .values("product_id", "product_name")
+        .annotate(net=Coalesce(Sum("quantity"), zero), receipts=Count("sale_id", distinct=True))
+        .order_by("net")
+        if r["net"]
+    ]
+    used_in = [
+        {
+            "product_id": l.product_id,
+            "name": l.product.name + (f" — {l.variant.label}" if l.variant_id else ""),
+            "quantity": str(l.quantity),
+        }
+        for l in item.recipe_lines.select_related("product", "variant").order_by("product__name")
+    ]
+    latest = []
+    for m in window.select_related("created_by").order_by("-created_at", "-id")[:150]:
+        row = {
+            "id": m.pk, "kind": m.kind, "kind_label": m.get_kind_display(),
+            "quantity": str(m.quantity), "stock_after": str(m.stock_after),
+            "reason": m.reason, "note": m.note, "sale": m.sale_id,
+            "receipt_code": m.receipt_code, "product_name": m.product_name,
+            "created_by_name": (m.created_by.get_full_name() or m.created_by.get_username()) if m.created_by_id else "",
+            "created_at": m.created_at.isoformat(),
+        }
+        if owner:
+            row["total_cost"] = str(m.total_cost)
+        latest.append(row)
+    return {
+        "item": {"id": item.pk, "name": item.name, "unit": item.unit},
+        "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "opening": str(opening),
+        "rows": rows,
+        "closing": str(closing),
+        "stock_now": str(item.stock),
+        "consistent": Decimal(all_sum) == Decimal(item.stock),
+        "used_by": used_by,
+        "used_in": used_in,
+        "moves": latest,
+    }
+
+
+# ── inventory ───────────────────────────────────────────────────────────────
+USE_KINDS = ("sale", "remake", "waste")
+USE_WINDOW = 14
+
+
+def daily_use(store_id, *, days: int = USE_WINDOW) -> dict:
+    """{item_id: average base units used per business day} over the last
+    `days` days — sales, remakes and waste. An item younger than the window is
+    averaged over the days it has existed, so a new item is not under-read."""
+    today = finance.today()
+    lo, _ = finance.bounds(today - timedelta(days=days - 1), today)
+    rows = (
+        models.StockMove.objects.for_pharmacy(store_id)
+        .filter(kind__in=USE_KINDS, created_at__gte=lo)
+        .values("item_id")
+        .annotate(q=Sum("quantity"))
+    )
+    born = dict(
+        models.InventoryItem.objects.for_pharmacy(store_id).values_list("pk", "created_at")
+    )
+    out = {}
+    for r in rows:
+        used = -Decimal(r["q"] or 0)
+        if used <= 0:
+            continue
+        age = (today - finance.business_date(born[r["item_id"]])).days + 1 if r["item_id"] in born else days
+        out[r["item_id"]] = used / Decimal(max(1, min(days, age)))
+    return out
+
+
+def days_left(stock, per_day) -> int | None:
+    stock = Decimal(stock or 0)
+    if not per_day or per_day <= 0:
+        return None
+    if stock <= 0:
+        return 0
+    return int(stock / per_day)
+
+
+def inventory_insights(store_id, start: date, end: date) -> dict:
+    """The stock page's overview tab, in money (owner only).
+
+    Every figure is a sum of StockMove.total_cost for business days
+    start..end, so it reconciles with each item's statement to the agora."""
+    today = finance.today()
+    stop = min(end, today)
+    lo, hi = finance.bounds(start, stop)
+    items = {
+        i.pk: i for i in models.InventoryItem.objects.for_pharmacy(store_id).filter(is_active=True)
+    }
+    zero = Decimal("0")
+    flow = defaultdict(lambda: zero)
+    daily = {start + timedelta(days=n): defaultdict(lambda: zero) for n in range((stop - start).days + 1)} if stop >= start else {}
+    used = defaultdict(lambda: [zero, zero])  # item → [qty, cost]
+    wasted = defaultdict(lambda: [zero, zero, defaultdict(int)])
+    moves = (
+        models.StockMove.objects.for_pharmacy(store_id)
+        .filter(created_at__gte=lo, created_at__lt=hi)
+        .values_list("item_id", "kind", "quantity", "total_cost", "created_at", "reason")
+    )
+    for item_id, kind, qty, cost, at, reason in moves.iterator(chunk_size=5000):
+        cost = Decimal(cost or 0)
+        day = daily.get(finance.business_date(at))
+        if kind == "purchase":
+            flow["purchases"] += cost
+            if day is not None:
+                day["purchases"] += cost
+        elif kind in ("sale", "remake"):
+            flow["used" if kind == "sale" else "remakes"] += cost
+            used[item_id][0] += -qty
+            used[item_id][1] += cost
+            if day is not None:
+                day["used"] += cost
+        elif kind == "waste":
+            flow["waste"] += cost
+            w = wasted[item_id]
+            w[0] += -qty
+            w[1] += cost
+            w[2][reason or "—"] += 1
+            if day is not None:
+                day["waste"] += cost
+        elif kind == "count":
+            flow["shortfall" if qty < 0 else "surplus"] += cost
+
+    by_cat = defaultdict(lambda: [zero, 0])
+    for i in items.values():
+        v = Decimal(i.stock_value or 0)
+        c = by_cat[i.category or "بلا تصنيف"]
+        c[0] += max(v, zero)
+        c[1] += 1
+    per_day = daily_use(store_id)
+    running_out = []
+    for i in items.values():
+        d = days_left(i.stock, per_day.get(i.pk))
+        if d is not None and d <= 7:
+            running_out.append({
+                "id": i.pk, "name": i.name, "unit": i.unit, "stock": str(i.stock),
+                "per_day": str(per_day[i.pk].quantize(Decimal("0.001"))), "days_left": d,
+            })
+    running_out.sort(key=lambda r: (r["days_left"], r["name"]))
+
+    def top(src, n):
+        rows = sorted(src.items(), key=lambda kv: kv[1][1], reverse=True)[:n]
+        out = []
+        for pk, v in rows:
+            if pk not in items:
+                continue
+            row = {"id": pk, "name": items[pk].name, "unit": items[pk].unit,
+                   "quantity": str(v[0]), "cost": str(finance.q2(v[1]))}
+            if len(v) > 2:
+                row["reasons"] = sorted(({"reason": k, "n": n} for k, n in v[2].items()), key=lambda r: -r["n"])[:3]
+            out.append(row)
+        return out
+
+    return {
+        "range": {"start": start.isoformat(), "end": end.isoformat(), "elapsed_end": stop.isoformat(),
+                  "days": max(0, (stop - start).days + 1)},
+        "stock_value": str(finance.q2(sum((max(Decimal(i.stock_value or 0), zero) for i in items.values()), zero))),
+        "items": len(items),
+        "flow": {k: str(finance.q2(flow[k])) for k in ("purchases", "used", "remakes", "waste", "shortfall", "surplus")},
+        "daily": [
+            {"date": d.isoformat(), **{k: str(finance.q2(v[k])) for k in ("purchases", "used", "waste")}}
+            for d, v in daily.items()
+        ],
+        "by_category": sorted(
+            ({"name": k, "value": str(finance.q2(v[0])), "items": v[1]} for k, v in by_cat.items()),
+            key=lambda r: -Decimal(r["value"]),
+        ),
+        "top_used": top(used, 8),
+        "top_waste": top(wasted, 5),
+        "running_out": running_out[:10],
+    }
+
+
+# ── one customer ────────────────────────────────────────────────────────────
+WEEKS = 12
+
+
+def customer_profile(store_id, customer, *, owner: bool) -> dict:
+    """What a café wants to know about one regular, from every sale they ever
+    made (voided sales are deleted; returns are their own rows).
+
+    Money (spend, average bill) is the owner's; visits, habits and favourites
+    are for whoever is at the counter."""
+    from django.utils import timezone as tz
+
+    sales = models.Sale.objects.for_pharmacy(store_id).filter(customer=customer, is_return=False)
+    rows = list(sales.values_list("id", "created_at", "discounted_total"))
+    refunds = (
+        models.SaleReturn.objects.for_pharmacy(store_id)
+        .filter(sale__customer=customer)
+        .aggregate(n=Coalesce(Sum("refund_amount"), Value(ZERO, output_field=DEC)))["n"]
+    )
+    today = finance.today()
+    visits = len(rows)
+    days = sorted({finance.business_date(at) for _, at, _ in rows})
+    first = days[0] if days else None
+    last = days[-1] if days else None
+    gap = ((last - first).days / (len(days) - 1)) if len(days) > 1 else None
+    since_last = (today - last).days if last else None
+    joined = finance.business_date(customer.created_at)
+    recent = sum(1 for d in days if (today - d).days < 30)
+
+    # One word for where they stand, in this order of precedence.
+    if not visits:
+        status = "no_visits"
+    elif (today - joined).days < 14 and recent < 8:
+        status = "new"
+    elif gap is not None and since_last is not None and since_last > max(14, gap * 3):
+        status = "fading"
+    elif recent >= 8:
+        status = "regular"
+    else:
+        status = "active"
+
+    # The last 12 weeks, Saturday-first like the rest of the app.
+    week0 = today - timedelta(days=(today.weekday() - finance.WEEK_START) % 7) - timedelta(weeks=WEEKS - 1)
+    weekly = {week0 + timedelta(weeks=i): [0, ZERO] for i in range(WEEKS)}
+    hours = [0] * 24
+    weekdays = [0] * 7
+    for _, at, total in rows:
+        d = finance.business_date(at)
+        hours[tz.localtime(at).hour] += 1
+        weekdays[(d.weekday() - finance.WEEK_START) % 7] += 1
+        if d >= week0:
+            w = weekly[d - timedelta(days=(d.weekday() - finance.WEEK_START) % 7)]
+            w[0] += 1
+            w[1] += Decimal(total or 0)
+
+    lines = (
+        models.SaleItem.objects.for_pharmacy(store_id)
+        .filter(sale__customer=customer, sale__is_return=False)
+        .values("product_id", "medication_name", "variant_label")
+        .annotate(qty=Sum("quantity"), n=Count("sale_id", distinct=True))
+    )
+    fav = {}
+    for r in lines:
+        key = r["product_id"] or r["medication_name"]
+        f = fav.setdefault(key, {"product_id": r["product_id"], "name": r["medication_name"], "qty": ZERO,
+                                 "orders": 0, "sizes": defaultdict(lambda: ZERO)})
+        f["qty"] += r["qty"] or 0
+        f["orders"] += r["n"]
+        if r["variant_label"]:
+            f["sizes"][r["variant_label"]] += r["qty"] or 0
+    cups = sum((f["qty"] for f in fav.values()), ZERO)
+    favourites = sorted(fav.values(), key=lambda f: (-f["qty"], -f["orders"]))[:5]
+
+    h0 = finance._hour()
+    out = {
+        "joined": joined.isoformat(),
+        "visits": visits,
+        "first_visit": first.isoformat() if first else None,
+        "last_visit": last.isoformat() if last else None,
+        "days_since_last": since_last,
+        "every_days": round(gap, 1) if gap is not None else None,
+        "visits_30d": recent,
+        "status": status,
+        "cups": str(cups.normalize()) if cups else "0",
+        "favourites": [
+            {
+                "product_id": f["product_id"], "name": f["name"], "qty": str(f["qty"].normalize()),
+                "share": str(q2(f["qty"] * 100 / cups)) if cups else "0.00",
+                "orders": f["orders"],
+                "size": max(f["sizes"].items(), key=lambda kv: kv[1])[0] if f["sizes"] else "",
+            }
+            for f in favourites
+        ],
+        # Business order: 04:00 first, so a 01:00 visit sits after midnight's.
+        "hours": [{"hour": (h0 + i) % 24, "visits": hours[(h0 + i) % 24]} for i in range(24)],
+        "weekdays": weekdays,
+        "weekly": [{"week": k.isoformat(), "visits": v[0], **({"spend": str(q2(v[1]))} if owner else {})}
+                   for k, v in weekly.items()],
+    }
+    if owner:
+        spent = sum((Decimal(t or 0) for _, _, t in rows), ZERO) - Decimal(refunds or 0)
+        out["spent"] = str(q2(spent))
+        out["avg_ticket"] = str(q2(spent / visits)) if visits else "0.00"
+    return out

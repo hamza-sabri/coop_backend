@@ -1938,6 +1938,11 @@ class StockMove(TimeStampedModel):
         WASTE = "waste", "هدر"
         COUNT = "count", "جرد"
         ADJUST = "adjust", "تعديل"
+        #: Taken by a sale's recipe (negative), or put back when that sale is
+        #: voided or edited (positive, same kind, so a sale's net is one sum).
+        SALE = "sale", "بيع"
+        #: A drink made again after a return — a second drink's ingredients.
+        REMAKE = "remake", "إعادة تحضير"
 
     store = models.ForeignKey(
         Store, related_name="stock_moves", on_delete=models.CASCADE
@@ -1950,8 +1955,11 @@ class StockMove(TimeStampedModel):
     unit_cost = models.DecimalField(
         max_digits=14, decimal_places=6, default=Decimal("0")
     )
+    #: Four places: a recipe's 18 g × ₪0.095/g is 1.7100, and a drink's cost
+    #: is the sum of such lines — rounding each to agorot would let the
+    #: inventory and the P&L drift apart by a shekel a week.
     total_cost = models.DecimalField(
-        max_digits=12, decimal_places=2, default=Decimal("0.00")
+        max_digits=14, decimal_places=4, default=Decimal("0")
     )
     stock_after = models.DecimalField(
         max_digits=14, decimal_places=3, default=Decimal("0")
@@ -1965,6 +1973,24 @@ class StockMove(TimeStampedModel):
     client_uuid = models.CharField(
         max_length=64, null=True, blank=True, default=None, db_index=True
     )
+    #: For sale / remake moves: which receipt and which line took it, and
+    #: which drink — kept as plain ids + a name snapshot as well, because the
+    #: answer to "where did 40 litres of milk go?" must survive a deleted
+    #: sale or a renamed drink.
+    sale = models.ForeignKey(
+        "store.Sale", related_name="stock_moves", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    sale_item = models.ForeignKey(
+        "store.SaleItem", related_name="stock_moves", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    product = models.ForeignKey(
+        "store.Product", related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    product_name = models.CharField(max_length=255, blank=True)
+    receipt_code = models.CharField(max_length=32, blank=True)
 
     objects = TenantManager()
     unguarded = models.Manager()
@@ -1978,6 +2004,7 @@ class StockMove(TimeStampedModel):
                 fields=["store", "client_uuid"], name="uniq_stockmove_client_uuid"
             )
         ]
+        indexes = [models.Index(fields=["store", "item", "created_at"])]
 
     def __str__(self):
         return f"{self.get_kind_display()} {self.quantity:+} {self.item_id}"
@@ -2187,3 +2214,71 @@ class DemoMark(models.Model):
 
     def __str__(self):
         return f"{self.model}#{self.object_pk}"
+
+
+# ---------------------------------------------------------------------------
+# Inventory categories + recipes
+# ---------------------------------------------------------------------------
+class InventoryCategory(TimeStampedModel):
+    """The owner's own list of raw-material groups (ألبان، تغليف…), picked
+    from a dropdown. InventoryItem.category holds the NAME, so a rename here
+    is carried onto the items by the API."""
+
+    store = models.ForeignKey(
+        Store, related_name="inventory_categories", on_delete=models.CASCADE
+    )
+    name = models.CharField(max_length=80)
+    position = models.PositiveSmallIntegerField(default=0)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["position", "name"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(fields=["store", "name"], name="uniq_invcat_name")
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class RecipeLine(TimeStampedModel):
+    """One ingredient of one drink: "200 ml of milk".
+
+    `variant` NULL = the drink's own recipe. A size with ANY lines of its own
+    uses only those (a large latte is not a small one plus extra); a size with
+    none uses the drink's. `quantity` is in the item's BASE unit (piece, g,
+    ml) — exact decimals, never floats; `display_unit` remembers how the owner
+    typed it (1 l, 18 g) so the form shows it back the same way.
+    """
+
+    store = models.ForeignKey(Store, related_name="recipe_lines", on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, related_name="recipe_lines", on_delete=models.CASCADE)
+    variant = models.ForeignKey(
+        ProductVariant, related_name="recipe_lines", null=True, blank=True,
+        on_delete=models.CASCADE,
+    )
+    item = models.ForeignKey(
+        InventoryItem, related_name="recipe_lines", on_delete=models.PROTECT
+    )
+    quantity = models.DecimalField(
+        max_digits=14, decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    display_unit = models.CharField(max_length=8, blank=True)
+    position = models.PositiveSmallIntegerField(default=0)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["position", "id"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        indexes = [models.Index(fields=["product", "variant"])]
+
+    def __str__(self):
+        return f"{self.product_id}/{self.variant_id or '-'}: {self.quantity} × {self.item_id}"

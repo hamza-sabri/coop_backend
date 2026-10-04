@@ -97,6 +97,10 @@ def sale_for_order(order, *, created_by=None):
         sale.discounted_total = discounted if discounted > 0 else Decimal("0.00")
         sale.save()
 
+        from apps.store import recipes
+
+        recipes.consume_sale(sale, user=created_by)
+
         order.sale = sale
         order.save(update_fields=["sale", "updated_at"])
         log.info("order %s collected -> sale %s (%s)", order.pk, sale.pk, sale.receipt_code)
@@ -128,6 +132,10 @@ def void_sale_for_order(order) -> bool:
         sale = order.sale
         if sale is None:
             return False
+
+        from apps.store import recipes
+
+        recipes.reverse_sale(sale, reason="إلغاء استلام طلب")
 
         # Stock first, while the lines still exist.
         for line in (sale.items.all() if tracks_menu_stock() else []):
