@@ -37,7 +37,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         try:
-            store = Store.objects.unscoped().get(slug=opts["slug"])
+            store = Store.objects.get(slug=opts["slug"])
         except Store.DoesNotExist as exc:
             raise CommandError(f"No store with slug {opts['slug']!r}") from exc
 

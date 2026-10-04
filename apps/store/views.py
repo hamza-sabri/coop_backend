@@ -36,6 +36,7 @@ from apps.accounts.firebase import (
     identity_filter,
 )
 from apps.store import points as points_service
+from apps.store.costing import tracks_menu_stock
 from apps.store import push as push_service
 from . import models, scan_tracking, serializers
 
@@ -220,7 +221,7 @@ def business_day_start():
     """
     from datetime import datetime, time as dtime
 
-    hour = int(getattr(settings, "BUSINESS_DAY_START_HOUR", 0))
+    hour = int(getattr(settings, "BUSINESS_DAY_START_HOUR", 4))
     now = timezone.localtime()
     day = now.date() if now.hour >= hour else now.date() - timedelta(days=1)
     return timezone.make_aware(datetime.combine(day, dtime(hour=hour)), now.tzinfo)
@@ -544,7 +545,7 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         perms = super().get_permissions()
         # Bulk delete/edit rewrite catalogue data — owners only, never employees.
-        if getattr(self, "action", None) in ("bulk_delete", "bulk_update"):
+        if getattr(self, "action", None) in ("bulk_delete", "bulk_update", "export_hesabate"):
             perms.append(OwnerRequired())
         return perms
 
@@ -892,6 +893,14 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             cache.set(catalog_version_key(pid), v, 15)
         return Response({"version": v})
 
+    def _strip_cost(self, payload):
+        """The cached stats are shared by everyone in the store; what the
+        stock COST is only the owner reads."""
+        u = self.request.user
+        if u.is_superuser or getattr(u, "role", "") == "owner":
+            return payload
+        return {k: v for k, v in payload.items() if k != "cost_value"}
+
     @action(detail=False, methods=["get"])
     def stats(self, request):
         """Catalogue KPIs computed in the DB: counts, stock, and inventory value.
@@ -901,7 +910,7 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         pid = self.store_id
         cached = cache.get(med_stats_key(pid))
         if cached is not None:
-            return Response(cached)
+            return Response(self._strip_cost(cached))
 
         money = DecimalField(max_digits=18, decimal_places=2)
         units = DecimalField(max_digits=18, decimal_places=3)
@@ -976,7 +985,7 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             },
         }
         cache.set(med_stats_key(pid), payload, MED_STATS_TTL)
-        return Response(payload)
+        return Response(self._strip_cost(payload))
 
 
 class MedicationVariantViewSet(StoreScopedMixin, viewsets.ModelViewSet):
@@ -1441,6 +1450,27 @@ class PublicStatsView(APIView):
         return Response(payload)
 
 
+class PublicOrderingView(APIView):
+    """GET /public/ordering/ — can customers order right now?
+
+    Its own endpoint rather than a flag on the menu: the menu is cached for
+    five minutes, and a switch that takes five minutes to take effect is a
+    switch that lets five minutes of orders in after it was turned off.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        from apps.store.modules import online_orders_open
+
+        slug = (request.query_params.get("store") or "").strip() or getattr(
+            settings, "CLERK_STORE_SLUG", ""
+        )
+        store = models.Store.objects.filter(slug=slug).first()
+        return Response({"open": bool(store) and online_orders_open(store)})
+
+
 class PublicMenuView(APIView):
     """The menu, for the customer app.
 
@@ -1769,9 +1799,12 @@ class CafeReportsBase(ReportsBaseView):
     OwnerRequired back on.
     """
 
+    # Revenue is the owner's (decided for كوب: cost, margin, takings,
+    # salaries and reports are owner-only, enforced here, not just hidden).
     permission_classes = [
         permissions.IsAuthenticated,
         ModuleEnabled,
+        OwnerRequired,
         StoreResolved,
     ]
 
@@ -2837,7 +2870,7 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     queryset = (
         models.Sale.objects.unscoped()
         .select_related("customer", "created_by", "debt")
-        .prefetch_related("items")
+        .prefetch_related("items", "items__returns", "returns", "bean_rows")
         # distinct=True because the search filter joins `items`; without it a
         # three-line sale would report three revisions.
         .annotate(
@@ -2925,9 +2958,34 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         perms = super().get_permissions()
         # Bulk delete wipes sales history (and reverses stock) — owners only,
         # never employees. Same rule as MedicationViewSet.bulk_delete.
-        if getattr(self, "action", None) == "bulk_delete":
+        # Period takings (the summary cards, day totals) are revenue, and
+        # revenue is the owner's. Employees keep the invoice list itself.
+        if getattr(self, "action", None) in ("bulk_delete", "stats", "day_summary"):
             perms.append(OwnerRequired())
         return perms
+
+    @action(detail=True, methods=["get", "post"], url_path="returns")
+    def returns_(self, request, pk=None):
+        """GET the returns on this sale; POST one line back.
+
+        POST {sale_item, quantity?, refund: "full"|"none", reason, note?,
+        client_uuid?}. The drink's cost stays booked (it was made); revenue
+        and points go back in proportion. Idempotent on client_uuid so the
+        offline outbox can retry it.
+        """
+        from apps.store import cafe_api
+
+        sale = self.get_object()
+        if request.method == "GET":
+            data = self.get_serializer(sale).data
+            return Response(data["returns"])
+        payload = cafe_api.SaleReturnInput(data=request.data)
+        payload.is_valid(raise_exception=True)
+        cafe_api.record_return(sale, payload.validated_data, request.user)
+        self._invalidate()
+        invalidate_reports_cache(self.store_id)
+        fresh = self.get_queryset().get(pk=sale.pk)
+        return Response(self.get_serializer(fresh).data, status=201)
 
     @staticmethod
     def _restores_stock(sale) -> bool:
@@ -2962,7 +3020,7 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             if locked is None:
                 return  # someone else voided it while we waited for the lock
 
-            if self._restores_stock(locked):
+            if self._restores_stock(locked) and tracks_menu_stock():
                 # sale → put stock back, return → take it out again
                 delta = -1 if locked.is_return else 1
                 for item in locked.items.all():
@@ -3258,6 +3316,12 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             ),
             count=Count("id"),
         )
+        # Money handed back over the counter in the window comes off it.
+        agg["amount"] -= models.SaleReturn.objects.for_pharmacy(pid).filter(
+            created_at__gte=start, created_at__lt=end
+        ).aggregate(
+            n=Coalesce(Sum("refund_amount"), Decimal("0.00"), output_field=money)
+        )["n"]
 
         items = models.SaleItem.objects.for_pharmacy(pid).filter(
             sale__created_at__gte=start, sale__created_at__lt=end
@@ -3366,7 +3430,7 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 # sale → put stock back, return → take it out again.
                 # Migrated Shamel invoices never took stock out, so crediting
                 # them back would invent stock — see _restores_stock.
-                if self._restores_stock(sale):
+                if self._restores_stock(sale) and tracks_menu_stock():
                     delta = -1 if sale.is_return else 1
                     for item in sale.items.all():
                         if item.variant_id:
@@ -3428,7 +3492,20 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             output_field=money,
         )
 
-        def bucket(qs):
+        # Business days (the 4am cutover), not calendar dates: 01:30 is still
+        # last night's takings, as it is on the P&L. And refunds handed back
+        # at the counter come off the day they were handed back.
+        from apps.store import finance
+
+        bday = finance.today()
+        refunds = models.SaleReturn.objects.for_pharmacy(pid)
+
+        def bucket(d1=None, d2=None):
+            qs, rq = sales, refunds
+            if d1 is not None:
+                lo, hi = finance.bounds(d1, d2 or bday)
+                qs = qs.filter(created_at__gte=lo, created_at__lt=hi)
+                rq = rq.filter(created_at__gte=lo, created_at__lt=hi)
             agg = qs.aggregate(
                 amount=Coalesce(
                     Sum(signed, output_field=money),
@@ -3437,25 +3514,19 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 ),
                 count=Count("id"),
             )
-            return {"amount": agg["amount"], "count": agg["count"]}
+            back = rq.aggregate(n=Coalesce(Sum("refund_amount"), Decimal("0.00"), output_field=money))["n"]
+            return {"amount": agg["amount"] - back, "count": agg["count"]}
 
         sales = models.Sale.objects.for_pharmacy(pid)
+        b_month = bday.replace(day=1)
+        b_last_end = b_month - timedelta(days=1)
         periods = {
-            "today": bucket(sales.filter(created_at__date=today)),
-            "yesterday": bucket(
-                sales.filter(created_at__date=today - timedelta(days=1))
-            ),
-            "week": bucket(
-                sales.filter(created_at__date__gte=today - timedelta(days=6))
-            ),
-            "month": bucket(sales.filter(created_at__date__gte=month_start)),
-            "last_month": bucket(
-                sales.filter(
-                    created_at__date__gte=last_month_start,
-                    created_at__date__lte=last_month_end,
-                )
-            ),
-            "all_time": bucket(sales),
+            "today": bucket(bday, bday),
+            "yesterday": bucket(bday - timedelta(days=1), bday - timedelta(days=1)),
+            "week": bucket(bday - timedelta(days=6), bday),
+            "month": bucket(b_month, bday),
+            "last_month": bucket(b_last_end.replace(day=1), b_last_end),
+            "all_time": bucket(),
         }
 
         window = today - timedelta(days=29)
@@ -4269,6 +4340,16 @@ class ShopOrdersView(APIView):
     @transaction.atomic
     def post(self, request):
         store, customer = self._resolve(request)
+        from apps.store.modules import online_orders_open
+
+        # Checked before anything else: with ordering off there is nobody on
+        # the other end, and an order accepted now is a customer standing at
+        # the counter for a drink nobody knows about.
+        if store is not None and not online_orders_open(store):
+            return Response(
+                {"detail": "الطلب من التطبيق متوقف حالياً. اطلب من الكاونتر", "code": "ordering_closed"},
+                status=403,
+            )
         if customer is None:
             return Response({"detail": "حسابك لسه ما اكتمل. أعد تسجيل الدخول"}, status=409)
 
@@ -4631,6 +4712,17 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         the list, is the number worth putting on a badge: an order being made is
         already someone's job; an order nobody has looked at is not.
         """
+        from apps.store.modules import online_orders_open
+
+        # The mixin carries only the id; the switch needs the store's plan and
+        # module list. One PK lookup, and only while ordering is switched on is
+        # this endpoint polled at all.
+        store = models.Store.objects.select_related("plan").get(pk=self.store_id)
+        if not online_orders_open(store):
+            return Response(
+                {"results": [], "recent": [], "pending": 0, "open": 0, "disabled": True}
+            )
+
         qs = (
             self.get_queryset()
             .filter(status__in=self.OPEN_STATUSES)

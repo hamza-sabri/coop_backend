@@ -203,10 +203,25 @@ AUTH_PASSWORD_VALIDATORS = [
 #: whatever hour it actually cashes up at) and every "today" figure follows.
 #:
 #: TIME_ZONE must be the SHOP's zone for this to mean anything.
-BUSINESS_DAY_START_HOUR = int(os.getenv("BUSINESS_DAY_START_HOUR", "0"))
+# The business day for كوب ends after the ~2am close, not at midnight: a 4am
+# cutover keeps one night's takings on one day, with slack for a late close.
+# Every "today", day/week window and shift filter reads THIS value.
+BUSINESS_DAY_START_HOUR = int(os.getenv("BUSINESS_DAY_START_HOUR", "4"))
+
+# Master switch for customer ordering (the /app web shop, the Flutter app, and
+# the admin's live-orders board). Off until the customer side is ready: with it
+# off the admin page disappears AND the order endpoint refuses, so a customer
+# can never place an order that nobody is watching for.
+ONLINE_ORDERS_ENABLED = env_bool("ONLINE_ORDERS_ENABLED", False)
+# Selling a drink does not move menu stock (a café has no count of lattes).
+# Raw materials live in InventoryItem and move by purchase / waste / count.
+TRACK_PRODUCT_STOCK = env_bool("TRACK_PRODUCT_STOCK", False)
 
 LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "en-us")
-TIME_ZONE = os.getenv("TIME_ZONE", "UTC")
+# The shop's own zone. The business day, the hour charts and the shift filter
+# are all LOCAL times; a UTC default turned the 4am cutover into 7am and put
+# the evening rush at 16:00 on every chart.
+TIME_ZONE = os.getenv("TIME_ZONE", "Asia/Hebron")
 USE_I18N = True
 USE_TZ = True
 

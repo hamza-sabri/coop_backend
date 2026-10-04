@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
+from apps.store.costing import tracks_menu_stock, unit_cost_for
+
 from apps.core.permissions import StoreRequired
 from apps.core.serializers import ImageUploadMixin
 from . import models
@@ -73,7 +75,50 @@ class CreatableNameField(serializers.Field):
         return existing or self.model.objects.create(store_id=pid, name=name)
 
 
-class ProductVariantSerializer(serializers.ModelSerializer):
+
+def _viewer_is_owner(serializer) -> bool:
+    """Whether the person asking may see what things COST.
+
+    No request in context (management commands, internal calls) counts as
+    owner: the filter exists to keep cost off an employee's screen, not to
+    hide it from the server itself.
+    """
+    request = (getattr(serializer, "context", None) or {}).get("request")
+    if request is None:
+        return True
+    user = getattr(request, "user", None)
+    if user is None or not getattr(user, "is_authenticated", False):
+        return False
+    return bool(user.is_superuser or getattr(user, "role", "") == "owner")
+
+
+class OwnerOnlyFieldsMixin:
+    """Fields only an owner reads or writes — cost, and what follows from it.
+
+    Stripped from the response for everyone else, and silently ignored on
+    their writes: an employee saving a drink must not zero its cost by
+    sending a form that never showed it.
+    """
+
+    owner_only_fields: tuple = ()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not _viewer_is_owner(self):
+            for f in self.owner_only_fields:
+                data.pop(f, None)
+        return data
+
+    def to_internal_value(self, data):
+        if not _viewer_is_owner(self) and hasattr(data, "keys"):
+            # QueryDict (multipart) copies keep their list semantics.
+            data = data.copy() if hasattr(data, "copy") else dict(data)
+            for f in self.owner_only_fields:
+                data.pop(f, None)
+        return super().to_internal_value(data)
+
+
+class ProductVariantSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
     """A sellable sub-SKU (color / size / flavor) with its own price and stock."""
 
     # Declared explicitly so it serialises as a STRING like every other money
@@ -83,6 +128,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         max_digits=12, decimal_places=2, read_only=True
     )
     is_pack = serializers.BooleanField(read_only=True)
+    owner_only_fields = ("cost",)
 
     class Meta:
         model = models.ProductVariant
@@ -136,7 +182,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class ProductSerializer(ImageUploadMixin, serializers.ModelSerializer):
+class ProductSerializer(OwnerOnlyFieldsMixin, ImageUploadMixin, serializers.ModelSerializer):
     """Full CRUD for a med.
 
     Images: `image`/`image_file` is the MAIN photo (URL or upload, as before).
@@ -147,6 +193,7 @@ class ProductSerializer(ImageUploadMixin, serializers.ModelSerializer):
     """
 
     MAX_GALLERY = 8
+    owner_only_fields = ("cost",)
 
     # Declared lax (required=False) so PATCH may omit it; validate() still
     # rejects a CREATE without a name — nothing is ever prefilled from other
@@ -487,6 +534,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
         return int(getattr(profile, "beans", 0) or 0)
 
     def create(self, validated_data):
+        adopt = validated_data.pop("_adopt", None)
         cu = validated_data.get("client_uuid")
         if cu:
             existing = models.Customer.objects.for_pharmacy(
@@ -494,14 +542,31 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             ).filter(client_uuid=cu).first()
             if existing is not None:
                 return existing
+        if adopt is not None:
+            if cu and not adopt.client_uuid:
+                adopt.client_uuid = cu
+                adopt.save(update_fields=["client_uuid", "updated_at"])
+            return adopt
         return super().create(validated_data)
 
     def validate_phone(self, value):
         # Empty phone -> NULL, so many customers may have no phone at all.
         return (value or "").strip() or None
 
+    def _offline_replay(self):
+        """A customer added at the counter while offline, now syncing.
+
+        Two things can have happened meanwhile, and neither is an error:
+        the same request already landed (a retry), or somebody else added the
+        same phone number. Same number = same person, so the existing row is
+        adopted: it takes this client id, and the sales rung for it offline
+        attach to the right customer instead of bouncing."""
+        data = getattr(self, "initial_data", None) or {}
+        return self.instance is None and str(data.get("merge_on_phone", "")).lower() in ("1", "true")
+
     def validate(self, attrs):
         phone = attrs.get("phone")
+        cu = attrs.get("client_uuid")
         if phone:
             # Unique per store — other tenants may share the number.
             qs = models.Customer.objects.for_pharmacy(_pharmacy_id(self)).filter(
@@ -509,7 +574,12 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             )
             if self.instance is not None:
                 qs = qs.exclude(pk=self.instance.pk)
-            if qs.exists():
+            if cu:
+                # A retry of this very create is not a duplicate.
+                qs = qs.exclude(client_uuid=cu)
+            if qs.exists() and self._offline_replay():
+                attrs["_adopt"] = qs.first()
+            elif qs.exists():
                 raise serializers.ValidationError(
                     {"phone": "رقم الهاتف مستخدم لزبون آخر."}
                 )
@@ -742,8 +812,18 @@ class DebtSerializer(serializers.ModelSerializer):
         return instance
 
 
-class SaleItemSerializer(serializers.ModelSerializer):
+class SaleItemSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer):
     """A single med line inside a sale. `line_total` is computed server-side."""
+
+    owner_only_fields = ("unit_cost",)
+    #: Units of this line already handed back (SaleReturn rows).
+    returned_quantity = serializers.SerializerMethodField()
+
+    def get_returned_quantity(self, obj) -> str:
+        rows = getattr(obj, "returns", None)
+        if rows is None or not getattr(obj, "pk", None):
+            return "0"
+        return str(sum((r.quantity for r in rows.all()), Decimal("0")))
 
     # unscoped() lookup base: validate() below rejects any product/variant
     # outside the requester's store (_same_pharmacy_or_die).
@@ -788,6 +868,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "price_was_overridden",
             "quantity",
             "line_total",
+            "unit_cost",
+            "returned_quantity",
         ]
         read_only_fields = [
             "id",
@@ -795,6 +877,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "category",
             "line_total",
             "price_was_overridden",
+            "unit_cost",
+            "returned_quantity",
         ]
 
     def validate(self, attrs):
@@ -846,6 +930,8 @@ class SaleSerializer(serializers.ModelSerializer):
         max_digits=12, decimal_places=2, required=False
     )
     beans_value = serializers.SerializerMethodField()
+    returns = serializers.SerializerMethodField()
+    refunded_total = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Sale
@@ -875,11 +961,40 @@ class SaleSerializer(serializers.ModelSerializer):
             # discount it cannot explain.
             "beans_value",
             "is_paid",
+            "returns",
+            "refunded_total",
             "updated_at",
         ]
         read_only_fields = [
             "id", "debt", "created_by", "created_at", "updated_at", "beans_value",
+            "returns", "refunded_total",
         ]
+
+    def _returns(self, obj):
+        rows = getattr(obj, "returns", None)
+        if rows is None or not getattr(obj, "pk", None):
+            return []
+        return list(rows.all())
+
+    def get_returns(self, obj) -> list:
+        return [
+            {
+                "id": r.pk,
+                "sale_item": r.sale_item_id,
+                "item_name": r.item_name,
+                "quantity": str(r.quantity),
+                "refund_amount": str(r.refund_amount),
+                "points_reversed": r.points_reversed,
+                "reason": r.reason,
+                "reason_label": r.get_reason_display(),
+                "note": r.note,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in self._returns(obj)
+        ]
+
+    def get_refunded_total(self, obj) -> str:
+        return str(sum((r.refund_amount for r in self._returns(obj)), Decimal("0.00")))
 
     def get_beans_value(self, obj) -> str:
         from apps.store import points as points_service
@@ -905,6 +1020,21 @@ class SaleSerializer(serializers.ModelSerializer):
         return full or user.get_username()
 
     def validate(self, attrs):
+        # A customer created at the counter while offline has no server id
+        # yet; the till sends the id it minted for them instead. The outbox
+        # syncs that customer first, so by now the row exists.
+        ccu = str((getattr(self, "initial_data", None) or {}).get("customer_client_uuid") or "").strip()
+        if ccu and not attrs.get("customer"):
+            found = (
+                models.Customer.objects.for_pharmacy(_pharmacy_id(self))
+                .filter(client_uuid=ccu)
+                .first()
+            )
+            if found is None:
+                raise serializers.ValidationError(
+                    {"customer": "الزبون لم يُزامَن بعد — أعد المحاولة بعد مزامنته."}
+                )
+            attrs["customer"] = found
         # Customer (when given) must belong to the requesting user's store;
         # each item's product is checked in SaleItemSerializer.validate.
         _same_pharmacy_or_die(self, attrs.get("customer"), "customer")
@@ -960,6 +1090,9 @@ class SaleSerializer(serializers.ModelSerializer):
                     # what the customer owes, and they owe the charged price.
                     "original_unit_price": item.get("original_unit_price"),
                     "quantity": item.get("quantity") or 1,
+                    # Frozen now: next month's cost must not rewrite this
+                    # month's margin.
+                    "unit_cost": unit_cost_for(med, variant),
                 }
             )
         return rows
@@ -1033,6 +1166,8 @@ class SaleSerializer(serializers.ModelSerializer):
                 delta = 1 if sale.is_return else -1
                 for row in rows:
                     models.SaleItem.objects.create(sale=sale, **row)
+                    if not tracks_menu_stock():
+                        continue
                     if row["variant"] is not None:
                         models.ProductVariant.objects.for_pharmacy(
                             store_id
@@ -1059,12 +1194,12 @@ class SaleSerializer(serializers.ModelSerializer):
                 if sale.customer_id and not sale.is_return:
                     from apps.store import points as points_service
 
-                    want = int(self.initial_data.get("beans_spent") or 0)
+                    want = int((getattr(self, "initial_data", None) or {}).get("beans_spent") or 0)
                     if want > 0:
                         spent = points_service.spend_on_purchase(
                             sale.store, sale.customer, want,
                             sale.discounted_total,
-                            source="بيع", source_id=sale.pk,
+                            source="بيع", source_id=sale.pk, sale=sale,
                         )
                         if spent > 0:
                             sale.beans_spent = spent
@@ -1076,7 +1211,7 @@ class SaleSerializer(serializers.ModelSerializer):
                                 sale.discounted_total = Decimal("0.00")
                     points_service.award_for_purchase(
                         sale.store, sale.customer, sale.discounted_total,
-                        source="بيع", source_id=sale.pk,
+                        source="بيع", source_id=sale.pk, sale=sale,
                     )
                 elif sale.customer_id and sale.is_return:
                     from apps.store import points as points_service
@@ -1308,7 +1443,7 @@ class SaleSerializer(serializers.ModelSerializer):
             #    if anything fails between the two.
             rows = self._snapshot_items(items_data)
             is_return = validated_data.get("is_return", sale.is_return)
-            if sale.moves_stock():
+            if sale.moves_stock() and tracks_menu_stock():
                 old_p, old_v = self._existing_deltas(sale)
                 new_p, new_v = self._stock_deltas(rows, is_return=is_return)
                 for ids, old, new, model in (

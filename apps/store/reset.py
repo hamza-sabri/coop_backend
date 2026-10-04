@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 #: Deleted, in dependency order — children before parents so a FK never blocks.
 #: The tuples are (label, model attribute, tenant filter kwargs builder).
 WIPES: list[tuple[str, str, str]] = [
+    # Returns point at sale lines; they go first.
+    ("المرتجعات", "SaleReturn", "store_id"),
     ("بنود الفواتير", "SaleItem", "sale__store_id"),
     ("مراجعات الفواتير", "SaleRevision", "sale__store_id"),
     ("الفواتير", "Sale", "store_id"),
@@ -52,6 +54,9 @@ WIPES: list[tuple[str, str, str]] = [
     ("أجهزة التطبيق", "DeviceToken", "store_id"),
     ("سجل الاستعلامات", "ScanDaily", "store_id"),
     ("سجل التغييرات", "AuditLog", "store_id"),
+    ("حركات المخزون", "StockMove", "store_id"),
+    ("المصاريف المسجلة", "Expense", "store_id"),
+    ("سجل البيانات التجريبية", "DemoMark", "store_id"),
     # Customers LAST of the rows: everything above points at them.
     ("الزبائن", "Customer", "store_id"),
 ]
@@ -62,6 +67,8 @@ KEPT = [
     "حسابات الموظفين والمالك",
     "إعدادات المتجر والخطة",
     "سلال نقاط البيع المفتوحة (مرتبطة بالموظف، لا بالمتجر)",
+    "أصناف المخزون (تبقى، ويُصفَّر رصيدها)",
+    "شرائح النقاط، الورديات، تصنيفات المصاريف والمصاريف الشهرية الثابتة",
 ]
 
 
@@ -105,6 +112,12 @@ def wipe_database(store) -> list[tuple[str, int]]:
         n, _ = model.unguarded.filter(**{field: store.pk}).delete()
         done.append((label, n))
         log.warning("reset: store=%s %s -> %s rows", store.slug, name, n)
+    # Raw materials stay on the list; what was on the shelf during testing
+    # does not. The first real count sets it.
+    from apps.store.models import InventoryItem
+
+    n = InventoryItem.unguarded.filter(store_id=store.pk).update(stock=0)
+    done.append(("أرصدة المخزون (صُفّرت)", n))
     return done
 
 

@@ -7,6 +7,7 @@ decrement stock twice. The guarantee is a per-store `client_uuid`.
 
 Run: python manage.py test apps.store.tests.test_sale_idempotency
 """
+from django.test import override_settings
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -19,6 +20,8 @@ from apps.store import models
 User = get_user_model()
 
 
+# These assert menu-stock movement, which only a retail vertical has.
+@override_settings(TRACK_PRODUCT_STOCK=True)
 class SaleIdempotencyTests(TestCase):
     @classmethod
     def setUpTestData(cls):

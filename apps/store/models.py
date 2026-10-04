@@ -895,6 +895,14 @@ class SaleItem(TimeStampedModel):
     line_total = models.DecimalField(
         max_digits=12, decimal_places=2, default=Decimal("0.00"), editable=False
     )
+    #: What ONE unit of this line cost the shop to make, frozen at the moment
+    #: of sale (the variant's cost, else the product's). NULL = the cost was
+    #: not known then — lines sold before costs were entered stay NULL rather
+    #: than being guessed backwards from today's prices, and the P&L reports
+    #: how much revenue carries no cost so the owner knows the gap is there.
+    unit_cost = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True
+    )
 
     objects = TenantManager("sale__store_id")
     unguarded = models.Manager()  # Django internals only — never app code
@@ -1339,6 +1347,12 @@ class BeanLedger(models.Model):
     note = models.CharField(max_length=255, blank=True)
     # Beans expire on INACTIVITY, and only at the base tier. Warned at 30/7/1.
     expires_at = models.DateField(null=True, blank=True, db_index=True)
+    #: The earn rate (percent) that produced this row — 2.00 means 2%. Kept
+    #: because the bands in settings change, and a receipt from March must
+    #: keep explaining itself with March's rate. NULL on non-earn rows.
+    rate_applied = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
     # A retried POST must not credit twice. This is the whole defence.
     idempotency_key = models.CharField(max_length=64, unique=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -1683,3 +1697,493 @@ class DeviceToken(TimeStampedModel):
 
     def __str__(self):
         return f"{self.customer_id} · {self.platform} · {self.token[:24]}…"
+
+
+# ---------------------------------------------------------------------------
+# Points bands
+# ---------------------------------------------------------------------------
+class EarnRule(TimeStampedModel):
+    """One band of the points ladder: receipts in [min_total, max_total) earn
+    `rate_percent` of the cash paid, on the WHOLE receipt.
+
+    A store with no rows earns at the default rate (settings.POINTS_EARN_RATE),
+    so the ladder is opt-in. `max_total` NULL = no upper bound. Bands are
+    edited as a set from settings (owner only); overlaps are refused there.
+    """
+
+    store = models.ForeignKey(
+        Store, related_name="earn_rules", on_delete=models.CASCADE
+    )
+    min_total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    max_total = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    rate_percent = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    position = models.PositiveSmallIntegerField(default=0)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["min_total", "position"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+
+    def __str__(self):
+        top = self.max_total if self.max_total is not None else "∞"
+        return f"{self.min_total}–{top}: {self.rate_percent}%"
+
+
+# ---------------------------------------------------------------------------
+# Returns
+# ---------------------------------------------------------------------------
+class SaleReturn(TimeStampedModel):
+    """A line (or part of one) handed back after the sale.
+
+    The drink was made, so its cost is NOT reversed — it is booked as waste
+    (`cost_written_off`). Revenue goes back by `refund_amount`, which is either
+    the line's full share of the paid total or zero (a remake). Points the sale
+    minted are reversed in the same proportion as the money.
+    """
+
+    class Reason(models.TextChoices):
+        WRONG = "wrong_order", "خطأ في الطلب"
+        TASTE = "taste", "الطعم"
+        LATE = "late", "تأخّر"
+        SPILLED = "spilled", "انسكب أو تلف"
+        CHANGED_MIND = "changed_mind", "غيّر رأيه"
+        OTHER = "other", "أخرى"
+
+    store = models.ForeignKey(
+        Store, related_name="sale_returns", on_delete=models.CASCADE
+    )
+    sale = models.ForeignKey(
+        Sale, related_name="returns", on_delete=models.CASCADE
+    )
+    sale_item = models.ForeignKey(
+        SaleItem, related_name="returns", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    #: Snapshot, so the return still reads right if the sale is later edited.
+    item_name = models.CharField(max_length=255, blank=True)
+    quantity = models.DecimalField(
+        max_digits=12, decimal_places=3, default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    refund_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    cost_written_off = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    points_reversed = models.IntegerField(default=0)
+    reason = models.CharField(max_length=20, choices=Reason.choices, db_index=True)
+    note = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    client_uuid = models.CharField(
+        max_length=64, null=True, blank=True, default=None, db_index=True
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "client_uuid"], name="uniq_return_client_uuid"
+            )
+        ]
+
+    def __str__(self):
+        return f"إرجاع {self.item_name} ×{self.quantity}"
+
+
+# ---------------------------------------------------------------------------
+# Raw-material inventory
+# ---------------------------------------------------------------------------
+class InventoryItem(TimeStampedModel):
+    """Something the café BUYS — cups, milk, beans, bananas — not something it
+    sells. Selling a drink never moves these (there are no recipes); they move
+    by purchases, waste and counts, each a StockMove.
+
+    Stock is held in a BASE unit (piece, g, ml) so 2 kg and 500 g add up. The
+    last purchase is remembered in the unit it was bought in ("1 kg for ₪10")
+    and `unit_cost` — per base unit — is derived from it.
+    """
+
+    class Unit(models.TextChoices):
+        PIECE = "piece", "قطعة"
+        GRAM = "g", "غرام"
+        ML = "ml", "مل"
+
+    class PurchaseUnit(models.TextChoices):
+        PIECE = "piece", "قطعة"
+        GRAM = "g", "غرام"
+        KG = "kg", "كيلو"
+        ML = "ml", "مل"
+        LITRE = "l", "لتر"
+
+    #: purchase unit -> (base unit, factor)
+    FACTORS = {
+        "piece": ("piece", Decimal("1")),
+        "g": ("g", Decimal("1")),
+        "kg": ("g", Decimal("1000")),
+        "ml": ("ml", Decimal("1")),
+        "l": ("ml", Decimal("1000")),
+    }
+
+    store = models.ForeignKey(
+        Store, related_name="inventory_items", on_delete=models.CASCADE
+    )
+    name = models.CharField(max_length=255, db_index=True)
+    category = models.CharField(max_length=120, blank=True, db_index=True)
+    unit = models.CharField(max_length=8, choices=Unit.choices, default=Unit.PIECE)
+    purchase_qty = models.DecimalField(
+        max_digits=12, decimal_places=3, default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    purchase_unit = models.CharField(
+        max_length=8, choices=PurchaseUnit.choices, default=PurchaseUnit.PIECE
+    )
+    purchase_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    #: Per BASE unit, derived on save. Six places: a gram of cocoa is 0.0450.
+    unit_cost = models.DecimalField(
+        max_digits=14, decimal_places=6, default=Decimal("0")
+    )
+    stock = models.DecimalField(max_digits=14, decimal_places=3, default=Decimal("0"))
+    reorder_level = models.DecimalField(
+        max_digits=14, decimal_places=3, default=Decimal("0")
+    )
+    expiry_date = models.DateField(null=True, blank=True, db_index=True)
+    supplier = models.CharField(max_length=255, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    client_uuid = models.CharField(
+        max_length=64, null=True, blank=True, default=None, db_index=True
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["name"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "client_uuid"], name="uniq_invitem_client_uuid"
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def to_base(cls, qty, purchase_unit) -> Decimal:
+        _, factor = cls.FACTORS.get(purchase_unit, ("piece", Decimal("1")))
+        return Decimal(str(qty or 0)) * factor
+
+    @classmethod
+    def base_unit_of(cls, purchase_unit) -> str:
+        return cls.FACTORS.get(purchase_unit, ("piece", Decimal("1")))[0]
+
+    def derive_unit_cost(self) -> Decimal:
+        base_qty = self.to_base(self.purchase_qty, self.purchase_unit)
+        if base_qty <= 0:
+            return Decimal("0")
+        return (Decimal(self.purchase_cost or 0) / base_qty).quantize(
+            Decimal("0.000001")
+        )
+
+    def save(self, *args, **kwargs):
+        self.unit = self.base_unit_of(self.purchase_unit)
+        self.unit_cost = self.derive_unit_cost()
+        super().save(*args, **kwargs)
+
+    @property
+    def stock_value(self) -> Decimal:
+        return (Decimal(self.stock or 0) * Decimal(self.unit_cost or 0)).quantize(
+            TWO_PLACES
+        )
+
+
+class StockMove(TimeStampedModel):
+    """Every change to an InventoryItem's stock, and what it cost.
+
+    `quantity` is SIGNED and in the item's base unit. A purchase is spend, not
+    cost of goods: it is reported on the inventory page and never in the P&L.
+    Waste is a real loss and IS in the P&L. A count records the difference
+    between what the system said and what was on the shelf.
+    """
+
+    class Kind(models.TextChoices):
+        PURCHASE = "purchase", "شراء"
+        WASTE = "waste", "هدر"
+        COUNT = "count", "جرد"
+        ADJUST = "adjust", "تعديل"
+
+    store = models.ForeignKey(
+        Store, related_name="stock_moves", on_delete=models.CASCADE
+    )
+    item = models.ForeignKey(
+        InventoryItem, related_name="moves", on_delete=models.CASCADE
+    )
+    kind = models.CharField(max_length=10, choices=Kind.choices, db_index=True)
+    quantity = models.DecimalField(max_digits=14, decimal_places=3)
+    unit_cost = models.DecimalField(
+        max_digits=14, decimal_places=6, default=Decimal("0")
+    )
+    total_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    stock_after = models.DecimalField(
+        max_digits=14, decimal_places=3, default=Decimal("0")
+    )
+    reason = models.CharField(max_length=120, blank=True)
+    note = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    client_uuid = models.CharField(
+        max_length=64, null=True, blank=True, default=None, db_index=True
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "client_uuid"], name="uniq_stockmove_client_uuid"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} {self.quantity:+} {self.item_id}"
+
+
+# ---------------------------------------------------------------------------
+# Shifts
+# ---------------------------------------------------------------------------
+class Shift(TimeStampedModel):
+    """A named stretch of the business day — صباحي 13:00–19:00, مسائي
+    19:00–02:00. Store-level: it says WHEN, not WHO. `end` before `start`
+    means the shift crosses midnight.
+
+    `wage_per_day` is what that shift's staff cost per day, used only by the
+    shift view's contribution margin; salaries for the P&L come from expenses.
+    """
+
+    store = models.ForeignKey(Store, related_name="shifts", on_delete=models.CASCADE)
+    name = models.CharField(max_length=60)
+    start = models.TimeField()
+    end = models.TimeField()
+    wage_per_day = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    position = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["position", "start"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+
+    def __str__(self):
+        return f"{self.name} {self.start:%H:%M}–{self.end:%H:%M}"
+
+    @property
+    def crosses_midnight(self) -> bool:
+        return self.end <= self.start
+
+    def contains(self, t) -> bool:
+        if self.crosses_midnight:
+            return t >= self.start or t < self.end
+        return self.start <= t < self.end
+
+    @property
+    def hours(self) -> Decimal:
+        s = self.start.hour * 60 + self.start.minute
+        e = self.end.hour * 60 + self.end.minute
+        mins = (e - s) % (24 * 60) or 24 * 60
+        return (Decimal(mins) / Decimal(60)).quantize(TWO_PLACES)
+
+
+# ---------------------------------------------------------------------------
+# Expenses
+# ---------------------------------------------------------------------------
+class ExpenseCategory(TimeStampedModel):
+    store = models.ForeignKey(
+        Store, related_name="expense_categories", on_delete=models.CASCADE
+    )
+    name = models.CharField(max_length=80)
+    #: Short key for the defaults (rent, salaries…) so the P&L can name them
+    #: whatever the owner renames them to. Blank for categories they add.
+    key = models.CharField(max_length=30, blank=True)
+    position = models.PositiveSmallIntegerField(default=0)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["position", "name"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(fields=["store", "name"], name="uniq_expcat_name")
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class Expense(TimeStampedModel):
+    """Money that left for running the shop.
+
+    `period` is the MONTH the cost belongs to (always the 1st); `paid_on` is
+    when it was actually paid. October's electricity paid on 5 November is
+    October's cost — the statement reports on `period`, never `paid_on`.
+    """
+
+    store = models.ForeignKey(Store, related_name="expenses", on_delete=models.CASCADE)
+    category = models.ForeignKey(
+        ExpenseCategory, related_name="expenses", on_delete=models.PROTECT
+    )
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    period = models.DateField(db_index=True)
+    paid_on = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+    client_uuid = models.CharField(
+        max_length=64, null=True, blank=True, default=None, db_index=True
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-period", "-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "client_uuid"], name="uniq_expense_client_uuid"
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.period:
+            self.period = self.period.replace(day=1)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.category_id} {self.amount} {self.period:%Y-%m}"
+
+
+class RecurringExpense(TimeStampedModel):
+    """A cost that repeats every month — rent, salaries, internet — entered
+    once instead of twelve times. Counted for every month from `start_month`
+    to `end_month` (NULL = still running)."""
+
+    store = models.ForeignKey(
+        Store, related_name="recurring_expenses", on_delete=models.CASCADE
+    )
+    category = models.ForeignKey(
+        ExpenseCategory, related_name="recurring", on_delete=models.PROTECT
+    )
+    name = models.CharField(max_length=120, blank=True)
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    start_month = models.DateField()
+    end_month = models.DateField(null=True, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["category__position", "name"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+
+    def save(self, *args, **kwargs):
+        if self.start_month:
+            self.start_month = self.start_month.replace(day=1)
+        if self.end_month:
+            self.end_month = self.end_month.replace(day=1)
+        super().save(*args, **kwargs)
+
+    def active_in(self, month) -> bool:
+        month = month.replace(day=1)
+        if month < self.start_month:
+            return False
+        return self.end_month is None or month <= self.end_month
+
+    def __str__(self):
+        return f"{self.name or self.category_id} {self.amount}/شهر"
+
+
+# ---------------------------------------------------------------------------
+# Showcase data registry
+# ---------------------------------------------------------------------------
+class DemoMark(models.Model):
+    """One row created by `seed_showcase`, so `purge_showcase` can delete
+    EXACTLY what it made and nothing the shop entered itself.
+
+    `restore` holds a previous value the seed overwrote (a product's cost),
+    put back on purge.
+    """
+
+    store = models.ForeignKey(Store, related_name="+", on_delete=models.CASCADE)
+    model = models.CharField(max_length=60, db_index=True)
+    object_pk = models.BigIntegerField()
+    restore = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        indexes = [models.Index(fields=["store", "model"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["store", "model", "object_pk"], name="uniq_demomark"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.model}#{self.object_pk}"

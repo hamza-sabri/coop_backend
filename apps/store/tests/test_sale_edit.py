@@ -10,6 +10,7 @@ That is also exactly how a till gets robbed: ring ₪300, take the cash, edit th
 invoice down to ₪30. Every test below exists because of one of those two
 sentences.
 """
+from django.test import override_settings
 from decimal import Decimal
 
 from django.db import transaction
@@ -19,6 +20,8 @@ from apps.accounts.models import User
 from apps.store import models
 
 
+# These assert menu-stock movement, which only a retail vertical has.
+@override_settings(TRACK_PRODUCT_STOCK=True)
 class SaleEditTests(APITestCase):
     def setUp(self):
         self.store = models.Store.objects.create(name="المودة", slug="almawdah")

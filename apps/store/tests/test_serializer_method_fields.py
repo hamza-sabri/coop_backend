@@ -14,8 +14,7 @@ closes the whole class, not the one instance.
 """
 import ast
 import pathlib
-
-import pytest
+from unittest import TestCase
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
@@ -54,23 +53,28 @@ def _methods(cls: ast.ClassDef) -> set[str]:
     }
 
 
-@pytest.mark.parametrize(
-    "path", list(_serializer_modules()), ids=lambda p: str(p.relative_to(ROOT))
-)
-def test_every_method_field_has_its_method(path: pathlib.Path):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    missing: list[str] = []
+class EveryMethodFieldHasItsMethod(TestCase):
+    """Runs under `manage.py test`. It used to be a pytest parametrize, and
+    pytest is not installed where the suite actually runs — so this guard
+    against a till-wide 500 had never once executed."""
 
-    # Only classes defined at module level; a serializer nested in a function
-    # is a test fixture, not shipped code.
-    for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
-        have = _methods(cls)
-        for field in sorted(_declared_method_fields(cls)):
-            if f"get_{field}" not in have:
-                missing.append(f"{cls.name}.{field} → get_{field}() not defined")
-
-    assert not missing, (
-        f"{path.relative_to(ROOT)}: SerializerMethodField without its method — "
-        "this is a 500 at render time, not an import error:\n  "
-        + "\n  ".join(missing)
-    )
+    def test_every_method_field_has_its_method(self):
+        paths = list(_serializer_modules())
+        self.assertTrue(paths, "no serializer modules found — the glob is wrong")
+        for path in paths:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                missing: list[str] = []
+                # Only classes defined at module level; a serializer nested in a
+                # function is a test fixture, not shipped code.
+                for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+                    have = _methods(cls)
+                    for field in sorted(_declared_method_fields(cls)):
+                        if f"get_{field}" not in have:
+                            missing.append(f"{cls.name}.{field} -> get_{field}() not defined")
+                self.assertFalse(
+                    missing,
+                    f"{path.relative_to(ROOT)}: SerializerMethodField without its method — "
+                    "this is a 500 at render time, not an import error:\n  "
+                    + "\n  ".join(missing),
+                )

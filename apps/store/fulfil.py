@@ -19,6 +19,8 @@ from decimal import Decimal
 from django.db import IntegrityError, transaction
 from django.db.models import F
 
+from apps.store.costing import tracks_menu_stock, unit_cost_for
+
 log = logging.getLogger(__name__)
 
 
@@ -76,10 +78,13 @@ def sale_for_order(order, *, created_by=None):
                 category=(getattr(getattr(product, "category", None), "name", "") or ""),
                 unit_price=line.unit_price,
                 quantity=line.quantity,
+                unit_cost=unit_cost_for(product, variant),
             )
             # Stock, exactly as SaleSerializer does it: the variant if there is
             # one, otherwise the product. F() so it is an atomic decrement.
             qty = line.quantity
+            if not tracks_menu_stock():
+                continue
             if variant is not None:
                 ProductVariant.objects.unscoped().filter(pk=variant.pk).update(stock=F("stock") - qty)
             elif product is not None:
@@ -125,7 +130,7 @@ def void_sale_for_order(order) -> bool:
             return False
 
         # Stock first, while the lines still exist.
-        for line in sale.items.all():
+        for line in (sale.items.all() if tracks_menu_stock() else []):
             qty = line.quantity
             if line.variant_id:
                 ProductVariant.objects.unscoped().filter(pk=line.variant_id).update(

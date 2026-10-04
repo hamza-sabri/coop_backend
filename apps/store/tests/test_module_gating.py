@@ -67,7 +67,10 @@ class ModuleFixtureMixin:
 
 class EffectiveModulesTests(ModuleFixtureMixin, TestCase):
     def test_empty_lists_mean_everything(self):
-        self.assertEqual(effective_modules(self.user_full), ALL_MODULES)
+        # "Everything" = every module this deployment has switched ON.
+        # online_orders sits behind ONLINE_ORDERS_ENABLED (default off), so a
+        # legacy store does not silently start taking app orders.
+        self.assertEqual(effective_modules(self.user_full), ALL_MODULES - {"online_orders"})
 
     def test_pharmacy_list_limits(self):
         self.assertEqual(effective_modules(self.user_pos), frozenset({"pos", "inventory"}))
@@ -201,4 +204,4 @@ class MeEndpointModulesTests(ModuleFixtureMixin, TestCase):
 
     def test_me_reports_all_for_legacy(self):
         res = self.FULL.get("/api/v1/auth/me/")
-        self.assertEqual(sorted(res.json()["modules"]), sorted(MODULES))
+        self.assertEqual(sorted(res.json()["modules"]), sorted(set(MODULES) - {"online_orders"}))

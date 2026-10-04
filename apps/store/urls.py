@@ -1,6 +1,6 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from . import views
+from . import cafe_api, views
 from apps.accounts.clerk import ClerkSyncView, ClerkWebhookView
 from apps.accounts.firebase import FirebaseSyncView
 
@@ -16,6 +16,11 @@ router.register(r"sales", views.SaleViewSet, basename="sale")
 router.register(r"staff", views.StaffViewSet, basename="staff")
 router.register(r"purchase-orders", views.PurchaseOrderViewSet, basename="purchase-order")
 router.register(r"orders", views.OrderViewSet, basename="order")
+router.register(r"inventory-items", cafe_api.InventoryItemViewSet, basename="inventory-item")
+router.register(r"shifts", cafe_api.ShiftViewSet, basename="shift")
+router.register(r"expense-categories", cafe_api.ExpenseCategoryViewSet, basename="expense-category")
+router.register(r"expenses", cafe_api.ExpenseViewSet, basename="expense")
+router.register(r"recurring-expenses", cafe_api.RecurringExpenseViewSet, basename="recurring-expense")
 # <scaffold:routes>
 urlpatterns = router.urls + [
     # Svix delivers Clerk signups here. Verified against the raw body.
@@ -41,6 +46,7 @@ urlpatterns = router.urls + [
     path("public/stats/", views.PublicStatsView.as_view(), name="public-stats"),
     # The customer app reads its menu here — see PublicMenuView.
     path("public/menu/", views.PublicMenuView.as_view(), name="public-menu"),
+    path("public/ordering/", views.PublicOrderingView.as_view(), name="public-ordering"),
     # The signed-in customer's own points, tier and history. Clerk-authed —
     # this is the shop app's equivalent of /auth/me/, and the reason the home
     # screen no longer ships hardcoded numbers.
@@ -69,6 +75,10 @@ urlpatterns = router.urls + [
     # Cashing up: the shift that is ending, uncached.
     # The café's own report — drinks, hours, the app, the loyalty scheme.
     path("reports/cafe/", views.ReportsCafeView.as_view(), name="reports-cafe"),
+    path("reports/pnl/", cafe_api.ReportsPnlView.as_view(), name="reports-pnl"),
+    path("reports/hours/", cafe_api.ReportsHoursView.as_view(), name="reports-hours"),
+    path("points/rules/", cafe_api.EarnRulesView.as_view(), name="points-rules"),
+    path("points/preview/", cafe_api.PointsPreviewView.as_view(), name="points-preview"),
     path("reports/summary/", views.ReportsSummaryView.as_view(), name="reports-summary"),
     path("reports/teaser/", views.ReportsTeaserView.as_view(), name="reports-teaser"),
     path("reports/sales/summary/", views.SalesReportsSummaryView.as_view(), name="reports-sales-summary"),

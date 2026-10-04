@@ -6,6 +6,7 @@ an empty body is rejected.
 
 Run: python manage.py test apps.store.tests.test_sales_bulk
 """
+from django.test import override_settings
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -21,6 +22,8 @@ User = get_user_model()
 BULK = "/api/v1/sales/bulk_delete/"
 
 
+# These assert menu-stock movement, which only a retail vertical has.
+@override_settings(TRACK_PRODUCT_STOCK=True)
 class SalesBulkDeleteTests(TenantFixtureMixin, TestCase):
     @classmethod
     def setUpTestData(cls):

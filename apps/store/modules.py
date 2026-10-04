@@ -39,6 +39,12 @@ MODULES: dict[str, str] = {
     "offline_inventory": "المخزون بدون إنترنت",
     "offline_customers": "الزبائن بدون إنترنت",
     "offline_purchases": "المشتريات بدون إنترنت",
+    # Customers ordering from the app. Behind ONLINE_ORDERS_ENABLED as well as
+    # the store's own module list — see pharmacy_modules().
+    "online_orders": "الطلب أونلاين من التطبيق",
+    # Profit & loss: expenses, the statement, shift margins. Its own key so
+    # it can be sold as an extra later.
+    "pnl": "الأرباح والمصاريف",
 }
 
 ALL_MODULES = frozenset(MODULES)
@@ -65,8 +71,22 @@ def pharmacy_modules(store) -> frozenset:
     enabled = normalize(getattr(store, "enabled_modules", None))
     plan = getattr(store, "plan", None)
     if plan is not None and getattr(plan, "is_active", True):
-        return frozenset(normalize(plan.modules)) | frozenset(enabled)
-    return frozenset(enabled) if enabled else ALL_MODULES
+        mods = frozenset(normalize(plan.modules)) | frozenset(enabled)
+    else:
+        mods = frozenset(enabled) if enabled else ALL_MODULES
+    # A global switch outranks every store's list. Without it, a legacy store
+    # ("empty = everything") would silently gain online ordering the moment the
+    # key was added — and start taking orders nobody is watching for.
+    from django.conf import settings
+
+    if not getattr(settings, "ONLINE_ORDERS_ENABLED", False):
+        mods = mods - {"online_orders"}
+    return mods
+
+
+def online_orders_open(store) -> bool:
+    """Can customers order from this store right now? One question, one place."""
+    return "online_orders" in pharmacy_modules(store)
 
 
 def effective_modules(user) -> frozenset:

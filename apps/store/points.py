@@ -24,7 +24,7 @@ Two invariants this module enforces, and neither is optional:
 from __future__ import annotations
 
 import logging
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from django.conf import settings
 from django.db import transaction
@@ -38,20 +38,43 @@ EARN_RATE = Decimal(str(getattr(settings, "POINTS_EARN_RATE", "0.02")))
 POINTS_PER_ILS = int(getattr(settings, "POINTS_PER_ILS", 10))
 
 
-def points_for(amount) -> int:
-    """Points earned on `amount` shekels spent.
+def rate_for(store, amount) -> Decimal:
+    """The earn rate, as a FRACTION (0.02 = 2%), for a receipt of `amount`.
 
-    Rounded half-up to a whole point: a customer who spends 17.50 ₪ earns 4
-    points, not 3.5. Fractional points would have to be displayed, explained
-    and stored, and they buy nothing.
+    The store's bands (EarnRule) pick the rate for the WHOLE receipt: a
+    ₪55 bill in a 50–100 → 5% band earns 5% on all ₪55, not 5% on the last
+    five. No bands, or no band covering the amount → the default EARN_RATE.
+    """
+    if store is None or amount is None:
+        return EARN_RATE
+    from apps.store.models import EarnRule
+
+    amt = Decimal(str(amount))
+    sid = getattr(store, "pk", store)
+    for rule in EarnRule.objects.for_pharmacy(sid).order_by("min_total", "position"):
+        if amt >= rule.min_total and (rule.max_total is None or amt < rule.max_total):
+            return Decimal(rule.rate_percent) / Decimal(100)
+    if EarnRule.objects.for_pharmacy(sid).exists():
+        # Bands are set but none covers this amount (a gap the owner left,
+        # or below the first band): earn nothing rather than guess.
+        return Decimal("0")
+    return EARN_RATE
+
+
+def points_for(amount, store=None, rate=None) -> int:
+    """Points earned on `amount` shekels of CASH paid.
+
+    FLOOR, once, at the end: ₪17.50 at 2% is 3.5 points → 3. Rounding up would
+    mint value nobody paid for; rounding per line would compound it.
     """
     if amount is None:
         return 0
     amt = Decimal(str(amount))
     if amt <= 0:
         return 0
-    raw = amt * EARN_RATE * POINTS_PER_ILS
-    return int(raw.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    r = rate if rate is not None else rate_for(store, amt)
+    raw = amt * Decimal(r) * POINTS_PER_ILS
+    return int(raw.to_integral_value(rounding=ROUND_FLOOR))
 
 
 def value_of(points: int) -> Decimal:
@@ -116,7 +139,8 @@ def _key(kind: str, source: str, source_id, cycle: int) -> str:
 
 
 @transaction.atomic
-def move(store, customer, delta: int, reason: str, note: str, idempotency_key: str):
+def move(store, customer, delta: int, reason: str, note: str, idempotency_key: str,
+         *, sale=None, rate_applied=None):
     """Apply a signed movement. Returns (ledger_row, applied: bool).
 
     `applied` is False when the key has been seen before — the caller's retry
@@ -162,6 +186,8 @@ def move(store, customer, delta: int, reason: str, note: str, idempotency_key: s
             "reason": reason,
             "balance_after": have + delta,
             "note": note or "",
+            "sale": sale,
+            "rate_applied": rate_applied,
         },
     )
     if not created:
@@ -172,16 +198,18 @@ def move(store, customer, delta: int, reason: str, note: str, idempotency_key: s
     return row, True
 
 
-def award_for_purchase(store, customer, amount, *, source: str, source_id, cycle: int = 0) -> int:
+def award_for_purchase(store, customer, amount, *, source: str, source_id, cycle: int = 0, sale=None) -> int:
     """Mint points for a completed purchase. Returns the points awarded.
 
     Called when the goods are actually handed over — an order marked collected,
     or a sale rung up — never when an order is merely placed. An order that is
-    cancelled must not have already paid out.
+    cancelled must not have already paid out. The band's rate is stored on the
+    ledger row so the receipt can explain itself later.
     """
     if customer is None:
         return 0
-    points = points_for(amount)
+    rate = rate_for(store, amount)
+    points = points_for(amount, rate=rate)
     if points <= 0:
         return 0
 
@@ -191,11 +219,38 @@ def award_for_purchase(store, customer, amount, *, source: str, source_id, cycle
         store, customer, points, BeanLedger.Reason.EARN,
         f"نقاط {source} #{source_id}",
         _key("earn", source, source_id, cycle),
+        sale=sale,
+        rate_applied=(rate * 100).quantize(Decimal("0.01")),
     )
     return points if applied else 0
 
 
-def spend_on_purchase(store, customer, points: int, amount, *, source: str, source_id, cycle: int = 0) -> int:
+def earned_on(sale) -> int:
+    """Points this sale actually minted, net of earlier partial reversals."""
+    from django.db.models import Sum
+
+    from apps.store.models import BeanLedger
+
+    rows = BeanLedger.objects.for_pharmacy(sale.store_id).filter(sale_id=sale.pk)
+    earned = rows.filter(reason=BeanLedger.Reason.EARN).aggregate(n=Sum("delta"))["n"] or 0
+    return int(earned)
+
+
+def reverse_points(store, customer, points: int, *, source: str, source_id, key: str, sale=None) -> int:
+    """Take back an exact number of points (a partial return). Clipped at the
+    balance by move(): the shop eats points already spent."""
+    if customer is None or not points or points <= 0:
+        return 0
+    from apps.store.models import BeanLedger
+
+    row, applied = move(
+        store, customer, -int(points), BeanLedger.Reason.ADJUST,
+        f"إرجاع {source} #{source_id}", f"return:{key}", sale=sale,
+    )
+    return -int(row.delta) if (applied and row is not None) else 0
+
+
+def spend_on_purchase(store, customer, points: int, amount, *, source: str, source_id, cycle: int = 0, sale=None) -> int:
     """Redeem points against a bill. Returns how many were actually spent.
 
     Clamped server-side against the live balance and the bill, because the
@@ -216,6 +271,7 @@ def spend_on_purchase(store, customer, points: int, amount, *, source: str, sour
         store, customer, -spend, BeanLedger.Reason.REDEEM,
         f"استبدال في {source} #{source_id}",
         _key("redeem", source, source_id, cycle),
+        sale=sale,
     )
     return spend if applied else 0
 
@@ -243,7 +299,7 @@ def reverse_award(store, customer, amount, *, source: str, source_id, cycle: int
     """
     if customer is None:
         return 0
-    points = points_for(amount)
+    points = points_for(amount, store=store)
     if points <= 0:
         return 0
     from apps.store.models import BeanLedger
