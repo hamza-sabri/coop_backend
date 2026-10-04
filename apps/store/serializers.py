@@ -718,8 +718,7 @@ class DebtSerializer(serializers.ModelSerializer):
         user = getattr(obj, "created_by", None)
         if not user:
             return ""
-        full = (user.get_full_name() or "").strip()
-        return full or user.get_username()
+        return user.staff_name
 
     def validate(self, attrs):
         # The customer must belong to the requesting user's store.
@@ -1022,8 +1021,7 @@ class SaleSerializer(serializers.ModelSerializer):
         user = getattr(obj, "created_by", None)
         if not user:
             return ""
-        full = (user.get_full_name() or "").strip()
-        return full or user.get_username()
+        return user.staff_name
 
     def validate(self, attrs):
         # A customer created at the counter while offline has no server id

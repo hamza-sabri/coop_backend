@@ -98,5 +98,9 @@ def effective_modules(user) -> frozenset:
     if user is None or not getattr(user, "store_id", None):
         return frozenset()
     tenant = pharmacy_modules(user.store)
+    if getattr(user, "is_owner", False):
+        # Owner or superuser: everything the shop has, whatever a stale
+        # per-user list says.
+        return tenant
     allowed = normalize(getattr(user, "allowed_modules", None))
     return tenant & frozenset(allowed) if allowed else tenant

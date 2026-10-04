@@ -397,7 +397,7 @@ def returns_report(store_id, start: date, end: date) -> dict:
         {
             "id": r.pk, "sale_id": r.sale_id, "item": r.item_name, "reason": labels.get(r.reason, r.reason),
             "note": r.note, "refund": str(r.refund_amount), "quantity": str(r.quantity),
-            "by": (r.created_by.get_full_name() or r.created_by.get_username()) if r.created_by_id else "",
+            "by": r.created_by.staff_name if r.created_by_id else "",
             "at": r.created_at.isoformat(),
         }
         for r in rets.select_related("created_by").order_by("-created_at")[:20]
@@ -479,7 +479,7 @@ def item_ledger(item, start: date, end: date, *, owner: bool) -> dict:
             "quantity": str(m.quantity), "stock_after": str(m.stock_after),
             "reason": m.reason, "note": m.note, "sale": m.sale_id,
             "receipt_code": m.receipt_code, "product_name": m.product_name,
-            "created_by_name": (m.created_by.get_full_name() or m.created_by.get_username()) if m.created_by_id else "",
+            "created_by_name": m.created_by.staff_name if m.created_by_id else "",
             "created_at": m.created_at.isoformat(),
         }
         if owner:

@@ -21,11 +21,16 @@ class UserSerializer(serializers.ModelSerializer):
     # The feature modules THIS account may use (store tier ∩ per-user
     # grants). The frontend builds its nav/routes from this list.
     modules = serializers.SerializerMethodField()
+    #: Owner OR platform superuser — full access. The frontend decides what to
+    #: show from this, never from `role` alone (a superuser's role may say
+    #: "employee").
+    is_owner = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             "id",
+            "is_owner",
             "store",
             "pharmacy_name",
             "store_slug",
@@ -73,6 +78,9 @@ class UserSerializer(serializers.ModelSerializer):
         from apps.store.modules import effective_modules
 
         return sorted(effective_modules(obj))
+
+    def get_is_owner(self, obj) -> bool:
+        return bool(getattr(obj, "is_owner", False))
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):

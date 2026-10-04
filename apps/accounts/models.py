@@ -85,6 +85,19 @@ class User(AbstractUser):
         ]
 
     @property
+    def staff_name(self) -> str:
+        """What a receipt, a ledger row or a report calls this person: the name
+        they go by — never a login e-mail. A platform account with no name is
+        "الإدارة"; anyone else falls back to the part of the username before
+        any "@"."""
+        name = (self.display_name or "").strip() or (self.get_full_name() or "").strip()
+        if name:
+            return name
+        if self.is_superuser:
+            return "الإدارة"
+        return self.get_username().split("@", 1)[0]
+
+    @property
     def is_owner(self) -> bool:
         """Store owner (or platform superuser) — full tenant access."""
         return self.is_superuser or self.role == self.Role.OWNER

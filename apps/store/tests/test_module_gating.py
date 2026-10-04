@@ -39,7 +39,7 @@ class ModuleFixtureMixin:
         cls.user_full = User.objects.create_user("u_full", password="x", store=cls.ph_full)
         # Full store, but this cashier is personally limited to POS.
         cls.user_cashier = User.objects.create_user(
-            "u_cashier", password="x", store=cls.ph_full, allowed_modules=["pos"]
+            "u_cashier", password="x", store=cls.ph_full, allowed_modules=["pos"], role="employee"
         )
 
         cls.med_pos = models.Product.objects.create(
@@ -80,7 +80,7 @@ class EffectiveModulesTests(ModuleFixtureMixin, TestCase):
 
     def test_user_grant_cannot_exceed_pharmacy(self):
         stray = User.objects.create_user(
-            "stray", password="x", store=self.ph_pos, allowed_modules=["debts", "pos"]
+            "stray", password="x", store=self.ph_pos, allowed_modules=["debts", "pos"], role="employee"
         )
         self.assertEqual(effective_modules(stray), frozenset({"pos"}))
 
@@ -205,3 +205,12 @@ class MeEndpointModulesTests(ModuleFixtureMixin, TestCase):
     def test_me_reports_all_for_legacy(self):
         res = self.FULL.get("/api/v1/auth/me/")
         self.assertEqual(sorted(res.json()["modules"]), sorted(set(MODULES) - {"online_orders"}))
+
+
+class OwnersAreNeverNarrowedTests(TestCase):
+    def test_an_owner_with_a_stale_module_list_still_gets_the_whole_shop(self):
+        from apps.store.modules import effective_modules, pharmacy_modules
+
+        store = models.Store.objects.create(name="S", slug="s-full")
+        owner = User.objects.create_user("own", password="x", store=store, role="owner", allowed_modules=["pos"])
+        self.assertEqual(effective_modules(owner), pharmacy_modules(store))

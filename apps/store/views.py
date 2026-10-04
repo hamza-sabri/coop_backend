@@ -3407,12 +3407,7 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                         "id": r.pk,
                         "version": r.version,
                         "edited_at": r.created_at.isoformat(),
-                        "edited_by": (
-                            (r.edited_by.get_full_name() or "").strip()
-                            or r.edited_by.get_username()
-                        )
-                        if r.edited_by_id
-                        else "",
+                        "edited_by": r.edited_by.staff_name if r.edited_by_id else "",
                         "snapshot": r.snapshot,
                     }
                     for r in rows
@@ -3919,7 +3914,12 @@ class StaffViewSet(viewsets.ModelViewSet):
         from apps.accounts.models import User
 
         pid = request_pharmacy_id(self.request)
-        return User.objects.filter(store_id=pid).order_by("-role", "username")
+        qs = User.objects.filter(store_id=pid)
+        if not self.request.user.is_superuser:
+            # The platform's own accounts are not the shop's staff: an owner
+            # sees, edits and deactivates their people — never ours.
+            qs = qs.filter(is_superuser=False)
+        return qs.order_by("-role", "username")
 
     @action(detail=True, methods=["post"], url_path="reset-password")
     def reset_password(self, request, pk=None):

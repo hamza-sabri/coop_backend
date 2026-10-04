@@ -466,7 +466,7 @@ def _move_json(m, owner: bool) -> dict:
         "quantity": str(m.quantity), "stock_after": str(m.stock_after),
         "reason": m.reason, "note": m.note,
         "sale": m.sale_id, "receipt_code": m.receipt_code, "product_name": m.product_name,
-        "created_by_name": (m.created_by.get_full_name() or m.created_by.get_username()) if m.created_by_id else "",
+        "created_by_name": m.created_by.staff_name if m.created_by_id else "",
         "created_at": m.created_at.isoformat(),
     }
     if owner:

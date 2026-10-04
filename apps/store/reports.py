@@ -778,12 +778,15 @@ def sales_summary(store_id: int, *, days: int = 30) -> dict:
     )
     by_employee = [
         {
-            "name": r["created_by__display_name"] or r["created_by__username"] or "—",
+            "name": (
+                r["created_by__display_name"]
+                or ("الإدارة" if r["created_by__is_superuser"] else (r["created_by__username"] or "—").split("@", 1)[0])
+            ),
             "total": str(r["total"]),
             "count": r["count"],
         }
         for r in (
-            sales.values("created_by__username", "created_by__display_name")
+            sales.values("created_by__username", "created_by__display_name", "created_by__is_superuser")
             .annotate(total=Coalesce(Sum(signed_total), zero), count=Count("id"))
             .order_by("-total")[:10]
         )

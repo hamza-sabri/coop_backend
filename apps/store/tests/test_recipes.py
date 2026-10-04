@@ -352,3 +352,21 @@ class StoredAvatarTests(RecipeBase):
             s = s.get("data", s)
             rows = s["results"] if isinstance(s, dict) else s
             self.assertEqual(rows[0]["customer_avatar"], "https://signed.example/x.jpg")
+
+
+class StaffAccessTests(RecipeBase):
+    def test_owner_sees_staff_but_not_superusers_and_superuser_is_owner(self):
+        su = User.objects.create_user(username="root@x.com", password="x", store=self.store, role="employee",
+                                      is_superuser=True, is_staff=True)
+        body = self.api.get("/api/v1/staff/").json()
+        body = body.get("data", body)
+        names = [u["username"] for u in (body.get("results", body) if isinstance(body, dict) else body)]
+        self.assertIn("e", names)
+        self.assertNotIn("root@x.com", names)
+        root = APIClient()
+        root.force_authenticate(su)
+        me = root.get("/api/v1/auth/me/").json()
+        me = me.get("data", me)
+        self.assertTrue(me["is_owner"])
+        self.assertEqual(su.staff_name, "الإدارة")
+        self.assertEqual(self.staff.get("/api/v1/staff/").status_code, 403)
