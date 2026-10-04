@@ -169,7 +169,8 @@ class Command(BaseCommand):
             self._bands()
             shifts = self._shifts()
             staff = self._staff(o["staff_password"])
-            customers = self._customers(int(o["customers"]))
+            # Spread over the window so "new customers this month" is believable.
+            customers = self._customers(int(o["customers"]), start)
             self.mark.flush()
         n_sales, n_returns = self._sales(products, customers, staff, start, today)
         with transaction.atomic():
@@ -244,7 +245,7 @@ class Command(BaseCommand):
             out.append(u)
         return out
 
-    def _customers(self, n):
+    def _customers(self, n, start):
         out = []
         used = set(
             models.Customer.objects.for_pharmacy(self.store)
@@ -261,10 +262,15 @@ class Command(BaseCommand):
                     phone = cand
                     used.add(cand)
                     break
-            c = models.Customer.objects.create(
-                store=self.store, name=name, phone=phone,
-                gender="female" if female else "male",
+            joined = timezone.make_aware(
+                datetime.combine(start + timedelta(days=int(self.rng.random() ** 2 * 55)), time(15)),
+                timezone.get_current_timezone(),
             )
+            with frozen(min(joined, timezone.now())):
+                c = models.Customer.objects.create(
+                    store=self.store, name=name, phone=phone,
+                    gender="female" if female else "male",
+                )
             self.mark.add(c)
             out.append(c)
         return out

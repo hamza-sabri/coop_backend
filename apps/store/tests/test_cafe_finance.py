@@ -397,3 +397,47 @@ class StatsFollowReturnsTests(Base):
         cache.clear()
         after = self.api.get("/api/v1/sales/stats/").json()["periods"]["today"]["amount"]
         self.assertEqual(Decimal(str(before)) - Decimal(str(after)), Decimal("12.00"))
+
+
+class ReportTabsTests(Base):
+    def test_every_tab_is_owner_only(self):
+        sale = self.sell([(self.latte, 1)])
+        urls = ["/api/v1/reports/items/", f"/api/v1/reports/items/{self.latte.pk}/",
+                "/api/v1/reports/times/", "/api/v1/reports/shifts/",
+                "/api/v1/reports/customers/", "/api/v1/reports/returns/"]
+        for u in urls:
+            self.assertEqual(self.api.get(u + "?period=month").status_code, 200, u)
+            self.assertEqual(self.staff.get(u + "?period=month").status_code, 403, u)
+        self.assertTrue(sale)
+
+    def test_items_rank_and_profit(self):
+        self.sell([(self.latte, 3), (self.water, 2)])
+        data = self.api.get("/api/v1/reports/items/?period=month").json()
+        latte = next(i for i in data["items"] if i["product_id"] == self.latte.pk)
+        water = next(i for i in data["items"] if i["product_id"] == self.water.pk)
+        self.assertEqual(latte["qty"], "3.00")
+        self.assertEqual(latte["profit"], "24.00")  # (12 - 4) × 3
+        self.assertEqual(latte["margin_pct"], "66.67")
+        # No cost entered: profit is unknown, not 100%.
+        self.assertIsNone(water["margin_pct"])
+        self.assertEqual(water["profit"], "0.00")
+        self.assertEqual(data["items"][0]["product_id"], self.latte.pk)
+
+    def test_item_detail_counts_today(self):
+        self.sell([(self.latte, 2)], customer=self.cust.pk)
+        d = self.api.get(f"/api/v1/reports/items/{self.latte.pk}/?period=month").json()
+        self.assertEqual(d["cups"]["today"], "2.00")
+        self.assertEqual(d["period"]["rank"], 1)
+        self.assertEqual(d["buyers"][0]["name"], "سامر")
+        self.assertIsNotNone(d["last_sold_at"])
+
+    def test_returns_tab_counts_reasons(self):
+        sale = self.sell([(self.latte, 2)])
+        self.api.post(f"/api/v1/sales/{sale.pk}/returns/",
+                      {"sale_item": sale.items.get().pk, "quantity": "1", "reason": "late", "refund": "none"},
+                      format="json")
+        d = self.api.get("/api/v1/reports/returns/?period=month").json()
+        self.assertEqual(d["count"], 1)
+        self.assertEqual(d["remakes"], 1)
+        self.assertEqual(d["by_reason"][0]["label"], "تأخّر")
+        self.assertEqual(d["rate_pct"], "50.00")

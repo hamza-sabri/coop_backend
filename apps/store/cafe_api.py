@@ -694,3 +694,72 @@ class ReportsHoursView(ReportsBaseView):
         data = finance.hourly_by_category(self.store_id, rng["start"], rng["end"], shift)
         data["range"] = {"start": rng["start"].isoformat(), "end": rng["end"].isoformat(), "period": rng["period"]}
         return Response(data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Report tabs — one question each (apps/store/breakdowns.py)
+# ═══════════════════════════════════════════════════════════════════════════
+class _RangeReport(ReportsBaseView):
+    required_module = "reports"
+
+    def range(self):
+        return finance.resolve_range(self.request.query_params)
+
+
+class ReportsItemsView(_RangeReport):
+    """GET /reports/items/?period=… every menu item, ranked."""
+
+    def get(self, request):
+        from apps.store import breakdowns
+
+        r = self.range()
+        data = breakdowns.items_report(self.store_id, r["start"], r["end"], period=r["period"])
+        data["range"] = {"start": r["start"].isoformat(), "end": r["end"].isoformat(), "period": r["period"]}
+        return Response(data)
+
+
+class ReportsItemDetailView(_RangeReport):
+    """GET /reports/items/<id>/?period=… one drink."""
+
+    def get(self, request, pk):
+        from apps.store import breakdowns
+
+        r = self.range()
+        data = breakdowns.item_detail(self.store_id, pk, r["start"], r["end"])
+        if data is None:
+            return Response({"detail": "غير موجود."}, status=404)
+        return Response(data)
+
+
+class ReportsTimesView(_RangeReport):
+    def get(self, request):
+        from apps.store import breakdowns
+
+        r = self.range()
+        return Response(breakdowns.times_report(self.store_id, r["start"], r["end"]))
+
+
+class ReportsShiftsView(_RangeReport):
+    required_module = "pnl"
+
+    def get(self, request):
+        from apps.store import breakdowns
+
+        r = self.range()
+        return Response(breakdowns.shifts_report(self.store_id, r["start"], r["end"]))
+
+
+class ReportsCustomersView(_RangeReport):
+    def get(self, request):
+        from apps.store import breakdowns
+
+        r = self.range()
+        return Response(breakdowns.customers_report(self.store_id, r["start"], r["end"]))
+
+
+class ReportsReturnsView(_RangeReport):
+    def get(self, request):
+        from apps.store import breakdowns
+
+        r = self.range()
+        return Response(breakdowns.returns_report(self.store_id, r["start"], r["end"]))
