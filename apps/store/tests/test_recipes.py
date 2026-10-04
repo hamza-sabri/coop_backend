@@ -40,7 +40,8 @@ class RecipeBase(TestCase):
         self.cup = item("كوب", "piece", "100", "10", "500")
         self.milk = item("حليب", "l", "1", "5", "10000")
         self.beans = item("بن", "kg", "1", "95", "2000")
-        self.latte = models.Product.objects.create(store=self.store, name="لاتيه", price=D("12"), cost=D("9"))
+        # No typed cost: the recipe stands in for it (see TypedCostTests).
+        self.latte = models.Product.objects.create(store=self.store, name="لاتيه", price=D("12"))
         self.large = models.ProductVariant.objects.create(product=self.latte, label="كبير", price=D("15"))
         self.small = models.ProductVariant.objects.create(product=self.latte, label="صغير", price=D("10"))
         for i, (it, q) in enumerate(((self.cup, "1"), (self.milk, "200"), (self.beans, "18"))):
@@ -321,3 +322,33 @@ class CustomerProfileTests(RecipeBase):
         sd = s.json().get("data", s.json())
         self.assertNotIn("spent", sd)
         self.assertNotIn("spend", sd["weekly"][0])
+
+
+class TypedCostTests(RecipeBase):
+    def test_the_owners_cost_wins_over_the_ingredients(self):
+        models.Product.objects.for_pharmacy(self.store).filter(pk=self.latte.pk).update(cost=D("4.50"))
+        sale = self.sell(1)
+        self.assertEqual(sale.items.get().unit_cost, D("4.5000"))
+        self.assertEqual(self.stock(self.milk), D("9800"))  # the shelf still moves by the recipe
+
+    def test_a_sizes_own_cost_wins_too(self):
+        models.ProductVariant.objects.for_pharmacy(self.store).filter(pk=self.large.pk).update(cost=D("5"))
+        sale = self.sell(1, variant=self.large)
+        self.assertEqual(sale.items.get().unit_cost, D("5.0000"))
+
+
+class StoredAvatarTests(RecipeBase):
+    def test_pos_list_and_sales_serve_a_link_not_the_storage_key(self):
+        from unittest import mock
+
+        c = models.Customer.objects.create(store=self.store, name="ليان", phone="0590000009", avatar="b2://avatars/x.jpg")
+        self.sell(1, customer=c.pk)
+        with mock.patch("apps.core.uploads.default_storage.url", return_value="https://signed.example/x.jpg"):
+            q = self.api.get("/api/v1/customers/quick/").json()
+            q = q.get("data", q)
+            row = next(r for r in q["results"] if r["id"] == c.pk)
+            self.assertEqual(row["avatar"], "https://signed.example/x.jpg")
+            s = self.api.get("/api/v1/sales/").json()
+            s = s.get("data", s)
+            rows = s["results"] if isinstance(s, dict) else s
+            self.assertEqual(rows[0]["customer_avatar"], "https://signed.example/x.jpg")

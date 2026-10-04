@@ -920,7 +920,7 @@ class SaleSerializer(serializers.ModelSerializer):
     customer_phone = serializers.CharField(source="customer.phone", read_only=True)
     # A face on the sales list. App customers have one; a walk-in falls back to
     # an initial, so the column never goes ragged.
-    customer_avatar = serializers.CharField(source="customer.avatar", read_only=True)
+    customer_avatar = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     #: How many earlier versions this sale has. 0 means it has never been
     #: edited — the UI marks anything above that so a corrected invoice is
@@ -969,6 +969,12 @@ class SaleSerializer(serializers.ModelSerializer):
             "id", "debt", "created_by", "created_at", "updated_at", "beans_value",
             "returns", "refunded_total",
         ]
+
+    def get_customer_avatar(self, obj) -> str:
+        from apps.core.uploads import resolve_stored_url
+
+        c = getattr(obj, "customer", None)
+        return resolve_stored_url(c.avatar) if c is not None else ""
 
     def _returns(self, obj):
         rows = getattr(obj, "returns", None)

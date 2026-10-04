@@ -2498,9 +2498,19 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     def quick(self, request):
         """Every customer in one Redis-cached payload for instant client-side
         search/filtering (POS pickers). `GET /api/v1/customers/quick/`."""
+        from apps.core.uploads import resolve_stored_url
+
+        def served(payload):
+            # Stored pictures are B2 keys; a link is signed per response, never
+            # cached, so a cached list can never hand out an expired URL.
+            return {
+                **payload,
+                "results": [{**r, "avatar": resolve_stored_url(r["avatar"])} for r in payload["results"]],
+            }
+
         cached = cache.get(customers_quick_key(self.store_id))
         if cached is not None:
-            return Response(cached)
+            return Response(served(cached))
         # avatar + beans ride along so the POS picker can show a face and a
         # balance without a request per customer.
         rows = [
@@ -2522,7 +2532,7 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         ]
         payload = {"count": len(rows), "results": rows}
         cache.set(customers_quick_key(self.store_id), payload, CUSTOMERS_QUICK_TTL)
-        return Response(payload)
+        return Response(served(payload))
 
     @action(detail=True, methods=["get"], url_path="profile")
     def profile(self, request, pk=None):

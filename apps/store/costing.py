@@ -13,27 +13,26 @@ from django.conf import settings
 def unit_cost_for(product, variant):
     """What one unit of this line costs the shop, or None if unknown.
 
-    A drink with a RECIPE costs what its ingredients cost (each one at its
-    last purchase price) — that is the number people can check. Without a
-    recipe, the cost typed by hand: the variant's own (a large latte costs
-    more than a small one), else the product's. Zero means "never entered",
-    which is not the same as free — it is stored as NULL so the P&L can say
-    how much revenue has no cost behind it instead of reporting 100% margin.
+    The cost the OWNER typed decides: the variant's own (a large latte costs
+    more than a small one), else the drink's. Ingredients are for the shelf
+    — what a sale takes from stock — not for pricing; their sum is used only
+    when no cost was ever typed, so a drink with a recipe is never reported
+    at 100% margin. Zero means "never entered", which is not the same as
+    free — stored as NULL so the P&L can say how much revenue has no cost
+    behind it.
     """
-    if product is not None:
-        from apps.store import recipes
-
-        rc = recipes.cost_of(
-            recipes.lines_for(product.store_id, product.pk, getattr(variant, "pk", None))
-        )
-        if rc is not None:
-            return rc
     for obj in (variant, product):
         if obj is None:
             continue
         cost = getattr(obj, "cost", None)
         if cost is not None and Decimal(cost) > 0:
             return Decimal(cost)
+    if product is not None:
+        from apps.store import recipes
+
+        return recipes.cost_of(
+            recipes.lines_for(product.store_id, product.pk, getattr(variant, "pk", None))
+        )
     return None
 
 
