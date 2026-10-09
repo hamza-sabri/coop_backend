@@ -256,6 +256,16 @@ def times_report(store_id, start: date, end: date) -> dict:
         d = finance.business_date(s["created_at"])
         per_day[d]["revenue"] += Decimal(s["discounted_total"] or 0)
         per_day[d]["tickets"] += 1
+    # Money handed back comes off the day it was handed back — the same rule
+    # as the profit statement, so a day here and a day there are one number.
+    for r in models.SaleReturn.objects.for_pharmacy(store_id).filter(
+        created_at__gte=lo, created_at__lt=hi
+    ).values("created_at", "refund_amount"):
+        per_day[finance.business_date(r["created_at"])]["revenue"] -= Decimal(r["refund_amount"] or 0)
+    for s in models.Sale.objects.for_pharmacy(store_id).filter(
+        created_at__gte=lo, created_at__lt=hi, is_return=True
+    ).values("created_at", "discounted_total"):
+        per_day[finance.business_date(s["created_at"])]["revenue"] -= Decimal(s["discounted_total"] or 0)
     # Average per weekday over the days that weekday actually occurred in the
     # window — a month has four Mondays and five Fridays, and a sum would
     # crown Friday for that alone.
