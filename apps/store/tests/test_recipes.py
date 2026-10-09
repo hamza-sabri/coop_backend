@@ -609,3 +609,134 @@ class TillCustomerListTests(RecipeBase):
         self.assertIn(cust.pk, rows)
         self.assertTrue(rows[cust.pk]["signed_up"])
         self.assertEqual(rows[cust.pk]["beans"], 5)
+
+
+class OffMenuTests(RecipeBase):
+    """A drink switched off (في المنيو) is not offered at the till."""
+
+    def test_switched_off_drink_leaves_the_till(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        off = models.Product.objects.create(store=self.store, name="test", price="17", is_active=False)
+        body = self.api.get("/api/v1/products/pos_catalog/").json()
+        ids = [r["id"] for r in body.get("data", body)["results"]]
+        self.assertNotIn(off.pk, ids)
+        self.assertIn(self.latte.pk, ids)
+        body = self.api.get("/api/v1/products/?is_active=true&page_size=100").json()
+        body = body.get("data", body)
+        names = [r["name"] for r in body.get("results", body)]
+        self.assertNotIn("test", names)
+
+
+class PointsRateTests(RecipeBase):
+    """The shop sets how many points make 1 ₪; points are spent in whole
+    shekels only; a bill keeps the value its points had when paid."""
+
+    def setUp(self):
+        super().setUp()
+        from apps.store import points as points_service
+
+        self.cust = models.Customer.objects.create(store=self.store, name="ليان")
+        points_service.adjust(self.store, self.cust, 175, "رصيد", key="t-rate")
+
+    def rate(self, n, client=None):
+        return (client or self.api).patch("/api/v1/points/rules/", {"points_per_ils": n}, format="json")
+
+    def test_only_fixed_rates_and_only_the_owner(self):
+        self.assertEqual(self.rate(55).status_code, 400)
+        self.assertEqual(self.rate(50, self.staff).status_code, 403)
+        r = self.rate(50)
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json().get("data", r.json())
+        self.assertEqual(body["points_per_ils"], 50)
+        self.assertEqual(body["points_outstanding"], 175)
+
+    def test_spends_whole_shekels_only(self):
+        # 10 per ₪: asked 55 → spends 50 = 5 ₪; 12 ₪ latte → pays 7.
+        s = self.sell(1, customer=self.cust.pk, beans_spent=55)
+        self.assertEqual(s.beans_spent, 50)
+        self.assertEqual(s.beans_value, D("5.00"))
+        self.assertEqual(s.discounted_total, D("7.00"))
+        # 50 per ₪: balance 125 (+earned) → at most 2 ₪ = 100 points.
+        self.rate(50)
+        s2 = self.sell(1, customer=self.cust.pk, beans_spent=999)
+        self.assertEqual(s2.beans_spent % 50, 0)
+        self.assertEqual(s2.beans_value, D(s2.beans_spent) / 50)
+
+    def test_a_rate_change_never_reprices_a_paid_bill(self):
+        s = self.sell(1, customer=self.cust.pk, beans_spent=30)  # 3 ₪ at 10/₪
+        q = f"?period=custom&start={s.created_at.date()}&end={s.created_at.date()}"
+        before = self.api.get("/api/v1/reports/pnl/" + q).json()
+        self.rate(100)
+        after = self.api.get("/api/v1/reports/pnl/" + q).json()
+        get = lambda b: b.get("data", b)["lines"]
+        self.assertEqual(get(before)["points_redeemed"], "3.00")
+        self.assertEqual(get(after)["points_redeemed"], "3.00")
+        self.assertEqual(get(after)["net_revenue"], get(before)["net_revenue"])
+        detail = self.api.get(f"/api/v1/sales/{s.pk}/").json()
+        self.assertEqual(detail.get("data", detail)["beans_value"], "3.00")
+
+    def test_earning_follows_the_rate(self):
+        from apps.store import points as points_service
+
+        self.rate(100)
+        # 2% of 50 ₪ = 1 ₪ = 100 points at 100/₪ (was 10 at 10/₪).
+        self.assertEqual(points_service.points_for(D("50"), store=self.store.pk, rate=D("0.02")), 100)
+        self.assertEqual(points_service.value_of(250, self.store.pk), D("2.50"))
+
+
+class PointsAreCalculatedTests(RecipeBase):
+    def test_employee_cannot_edit_points_owner_can(self):
+        c = models.Customer.objects.create(store=self.store, name="سما")
+        r = self.staff.post(f"/api/v1/customers/{c.pk}/points/", {"delta": 50, "note": "x"}, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.staff.get(f"/api/v1/customers/{c.pk}/points/").status_code, 200)
+        r = self.api.post(f"/api/v1/customers/{c.pk}/points/", {"delta": 50, "note": "x"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+
+    def test_a_customer_needs_only_a_name(self):
+        r = self.staff.post("/api/v1/customers/", {"name": "زبون بلا هاتف"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+
+
+class CardPaymentTests(RecipeBase):
+    def test_a_card_sale_is_recorded_and_filtered(self):
+        s = self.sell(1, payment_method="card")
+        self.assertEqual(s.payment_method, "card")
+        self.assertIsNone(s.debt_id)
+        cash = self.sell(1)
+        self.assertEqual(cash.payment_method, "cash")
+        body = self.api.get("/api/v1/sales/?payment_method=card").json()
+        body = body.get("data", body)
+        ids = [r["id"] for r in body.get("results", body)]
+        self.assertEqual(ids, [s.pk])
+
+
+class DrinkBuyersTests(RecipeBase):
+    def test_who_orders_a_drink_most(self):
+        a = models.Customer.objects.create(store=self.store, name="ريم", avatar="https://x/a.png")
+        b = models.Customer.objects.create(store=self.store, name="عمر")
+        self.sell(2, customer=a.pk)
+        self.sell(1, customer=a.pk)
+        self.sell(1, customer=b.pk)
+        self.sell(5)  # walk-in: not a buyer
+        r = self.api.get(f"/api/v1/reports/items/{self.latte.pk}/?period=month")
+        self.assertEqual(r.status_code, 200, r.content)
+        buyers = r.json().get("data", r.json())["buyers"]
+        self.assertEqual([x["customer_id"] for x in buyers], [a.pk, b.pk])
+        self.assertEqual(buyers[0]["qty"], "3.00")
+        self.assertEqual(buyers[0]["times"], 2)
+        self.assertEqual(buyers[0]["avatar"], "https://x/a.png")
+
+
+class TillCatalogPictureTests(RecipeBase):
+    def test_the_offline_catalogue_carries_the_picture(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        models.Product.objects.for_pharmacy(self.store).filter(pk=self.latte.pk).update(image="https://img.example/latte.webp")
+        for _ in range(2):  # fresh, then from the cache
+            body = self.api.get("/api/v1/products/pos_catalog/").json()
+            rows = {r["id"]: r for r in body.get("data", body)["results"]}
+            self.assertEqual(rows[self.latte.pk]["image"], "https://img.example/latte.webp")

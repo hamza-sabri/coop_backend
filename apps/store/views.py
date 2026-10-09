@@ -352,7 +352,7 @@ class ProductFilter(django_filters.FilterSet):
 
     class Meta:
         model = models.Product
-        fields = ["brand", "barcode", "source_id", "category"]
+        fields = ["brand", "barcode", "source_id", "category", "is_active"]
 
     def by_category(self, queryset, name, value):
         """Match by NAME even when given an id.
@@ -842,10 +842,23 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         `GET /api/v1/products/pos_catalog/` — the POS keeps this client-side
         so barcode scans resolve instantly with zero network round-trips.
         """
+        from apps.core.uploads import resolve_stored_url
+
         pid = self.store_id
+
+        def served(payload):
+            # Pictures are stored as b2:// keys; a link is signed per response
+            # and never cached, so a cached catalogue can't hand out an expired
+            # URL. The till keeps this catalogue offline, which is what keeps
+            # the drinks' pictures on screen while the server is restarting.
+            return {
+                **payload,
+                "results": [{**r, "image": resolve_stored_url(r.get("image") or "")} for r in payload["results"]],
+            }
+
         cached = cache.get(pos_catalog_key(pid))
         if cached is not None:
-            return Response(cached)
+            return Response(served(cached))
         variants_by_med = {}
         for v in models.ProductVariant.objects.for_pharmacy(pid).filter(
             is_active=True
@@ -876,16 +889,18 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 "price": r["price"],
                 "stock": r["stock"],
                 "category": r["category__name"] or "",
+                "image": r["image"] or "",
                 "variants": variants_by_med.get(r["id"], []),
             }
-            for r in models.Product.objects.for_pharmacy(pid).values(
+            # Off the menu (في المنيو switched off) = not sold at the till.
+            for r in models.Product.objects.for_pharmacy(pid).filter(is_active=True).values(
                 "id", "name", "barcode", "alt_barcodes", "price", "stock",
-                "category__name",
+                "category__name", "image",
             )
         ]
         payload = {"count": len(rows), "results": rows}
         cache.set(pos_catalog_key(pid), payload, POS_CATALOG_TTL)
-        return Response(payload)
+        return Response(served(payload))
 
     @action(detail=False, methods=["get"])
     def catalog_version(self, request):
@@ -2657,6 +2672,12 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
 
         if request.method == "POST":
+            # Points are worked out from what the customer bought — staff
+            # never type them. Only the owner may correct a balance by hand.
+            from apps.store.cafe_api import _is_owner
+
+            if not _is_owner(request.user):
+                return Response({"detail": "النقاط تُحسب تلقائياً — التعديل اليدوي للمالك فقط."}, status=403)
             try:
                 delta = int(request.data.get("delta") or 0)
             except (TypeError, ValueError):
@@ -2687,12 +2708,12 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 )
             out = points_service.totals_for(store, customer)
             out["moved"] = moved
-            out["value_ils"] = str(points_service.value_of(out["balance"]))
+            out["value_ils"] = str(points_service.value_of(out["balance"], store))
             return Response(out, status=200)
 
         out = points_service.totals_for(store, customer)
-        out["value_ils"] = str(points_service.value_of(out["balance"]))
-        out["points_per_ils"] = points_service.POINTS_PER_ILS
+        out["value_ils"] = str(points_service.value_of(out["balance"], store))
+        out["points_per_ils"] = points_service.per_ils(store)
         out["earn_rate"] = str(points_service.EARN_RATE)
         out["activity"] = [
             {
@@ -4477,8 +4498,8 @@ class ShopMeView(APIView):
             # The whole scheme, sent to the phone rather than hard-coded in it:
             # the balance's worth in shekels, and the two rates behind it. When
             # the shop changes the rate, the app changes with it.
-            "value_ils": str(points_service.value_of(beans)),
-            "points_per_ils": points_service.POINTS_PER_ILS,
+            "value_ils": str(points_service.value_of(beans, store)),
+            "points_per_ils": points_service.per_ils(store),
             "earn_rate": str(points_service.EARN_RATE),
             "activity": [
                 {
@@ -4601,7 +4622,8 @@ class ShopOrdersView(APIView):
             )
             if spend > 0:
                 order.beans_spent = spend
-                order.save(update_fields=["beans_spent"])
+                order.beans_value = points_service.value_of(spend, store)
+                order.save(update_fields=["beans_spent", "beans_value"])
                 push_service.notify_points(
                     store, customer, -spend,
                     points_service.balance_of(customer),
@@ -5032,7 +5054,7 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
         # ── leaving `collected`: the sale it made never happened ──────────
         if previous == COLLECTED:
-            paid = (order.total or Decimal("0")) - points_service.value_of(spent)
+            paid = (order.total or Decimal("0")) - (order.beans_value if spent else Decimal("0"))
             void_sale_for_order(order)
             points_service.reverse_award(
                 order.store, order.customer, paid,
@@ -5054,7 +5076,7 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 order,
                 created_by=request.user if request.user.is_authenticated else None,
             )
-            paid = (order.total or Decimal("0")) - points_service.value_of(spent)
+            paid = (order.total or Decimal("0")) - (order.beans_value if spent else Decimal("0"))
             earned = points_service.award_for_purchase(
                 order.store, order.customer, paid,
                 source="طلب", source_id=order.pk,

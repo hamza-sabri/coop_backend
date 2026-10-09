@@ -522,8 +522,9 @@ class Command(BaseCommand):
                     )
                     if spent:
                         sale.beans_spent = spent
+                        sale.beans_value = points_service.value_of(spent, self.store)
                         sale.discounted_total = max(
-                            Decimal("0.00"), sale.discounted_total - points_service.value_of(spent)
+                            Decimal("0.00"), sale.discounted_total - sale.beans_value
                         )
                 points_service.award_for_purchase(
                     self.store, customer, sale.discounted_total,
@@ -532,7 +533,7 @@ class Command(BaseCommand):
                 models.LoyaltyProfile.objects.for_pharmacy(self.store).filter(
                     customer=customer
                 ).update(last_visit_at=when)
-            sale.save(update_fields=["total", "discounted_total", "beans_spent"])
+            sale.save(update_fields=["total", "discounted_total", "beans_spent", "beans_value"])
             # The same path a till sale takes: the recipe comes off the shelf.
             recipes.consume_sale(sale, user=sale.created_by)
         return sale

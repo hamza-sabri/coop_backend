@@ -194,12 +194,22 @@ def item_detail(store_id, product_id: int, start: date, end: date) -> dict | Non
             "profit": str(q2(sp)),
             "margin_pct": str(q2(sp * 100 / cr)) if cr else None,
         })
+    # Who orders it most — each a link to their profile on the app.
     buyers = [
-        {"customer_id": r["sale__customer_id"], "name": r["sale__customer__name"], "qty": str(q2(r["qty"]))}
+        {
+            "customer_id": r["sale__customer_id"],
+            "name": r["sale__customer__name"],
+            "avatar": resolve_stored_url(r["sale__customer__avatar"]),
+            "qty": str(q2(r["qty"])),
+            "times": r["times"],
+        }
         for r in mine.exclude(sale__customer_id=None)
-        .values("sale__customer_id", "sale__customer__name")
-        .annotate(qty=Coalesce(Sum("quantity"), Value(ZERO, output_field=DEC)))
-        .order_by("-qty")[:5]
+        .values("sale__customer_id", "sale__customer__name", "sale__customer__avatar")
+        .annotate(
+            qty=Coalesce(Sum("quantity"), Value(ZERO, output_field=DEC)),
+            times=Count("sale_id", distinct=True),
+        )
+        .order_by("-qty", "-times")[:8]
     ]
     lo, hi = finance.bounds(start, end)
     rets = (
@@ -365,9 +375,9 @@ def customers_report(store_id, start: date, end: date) -> dict:
         "new": len(ids - before),
         "added": added,
         "points": {
-            "earned": int(earned), "earned_value": str(points_service.value_of(earned)),
-            "redeemed": int(redeemed), "redeemed_value": str(points_service.value_of(redeemed)),
-            "outstanding": int(outstanding), "outstanding_value": str(points_service.value_of(outstanding)),
+            "earned": int(earned), "earned_value": str(points_service.value_of(earned, store_id)),
+            "redeemed": int(redeemed), "redeemed_value": str(points_service.value_of(redeemed, store_id)),
+            "outstanding": int(outstanding), "outstanding_value": str(points_service.value_of(outstanding, store_id)),
         },
         "top": [
             {

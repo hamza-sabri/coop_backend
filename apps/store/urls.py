@@ -1,6 +1,6 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from . import cafe_api, views
+from . import cafe_api, cash_drawer, views
 from apps.accounts.clerk import ClerkSyncView, ClerkWebhookView
 from apps.accounts.firebase import FirebaseSyncView
 
@@ -77,6 +77,10 @@ urlpatterns = router.urls + [
     # Cashing up: the shift that is ending, uncached.
     # The café's own report — drinks, hours, the app, the loyalty scheme.
     path("reports/cafe/", views.ReportsCafeView.as_view(), name="reports-cafe"),
+    path("cash-drawer/", cash_drawer.CashDrawerView.as_view(), name="cash-drawer"),
+    path("cash-drawer/open/", cash_drawer.CashDrawerOpenView.as_view(), name="cash-drawer-open"),
+    path("cash-drawer/move/", cash_drawer.CashDrawerMoveView.as_view(), name="cash-drawer-move"),
+    path("cash-drawer/close/", cash_drawer.CashDrawerCloseView.as_view(), name="cash-drawer-close"),
     path("reports/pnl/", cafe_api.ReportsPnlView.as_view(), name="reports-pnl"),
     path("reports/hours/", cafe_api.ReportsHoursView.as_view(), name="reports-hours"),
     path("reports/items/", cafe_api.ReportsItemsView.as_view(), name="reports-items"),

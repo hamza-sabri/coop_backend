@@ -56,6 +56,8 @@ WIPES: list[tuple[str, str, str]] = [
     ("سجل التغييرات", "AuditLog", "store_id"),
     ("حركات المخزون", "StockMove", "store_id"),
     ("المصاريف المسجلة", "Expense", "store_id"),
+    ("حركات الصندوق", "CashMove", "store_id"),
+    ("جلسات الصندوق", "CashSession", "store_id"),
     ("سجل البيانات التجريبية", "DemoMark", "store_id"),
     # Customers LAST of the rows: everything above points at them.
     ("الزبائن", "Customer", "store_id"),

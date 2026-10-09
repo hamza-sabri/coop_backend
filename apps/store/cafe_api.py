@@ -712,11 +712,28 @@ class EarnRulesView(APIView):
                 for r in rules
             ],
             "default_rate_percent": str((points_service.EARN_RATE * 100).quantize(CENT)),
-            "points_per_ils": points_service.POINTS_PER_ILS,
+            "points_per_ils": points_service.per_ils(store_id),
+            # Points customers hold right now — the settings screen warns that
+            # a new rate changes what these are worth.
+            "points_outstanding": int(
+                models.LoyaltyProfile.objects.for_pharmacy(store_id).aggregate(n=Sum("beans"))["n"] or 0
+            ),
         }
 
     def get(self, request):
         return Response(self._payload(request_pharmacy_id(request)))
+
+    def patch(self, request):
+        """`{points_per_ils: 10}` — how many points make one shekel."""
+        store_id = request_pharmacy_id(request)
+        try:
+            per = int(request.data.get("points_per_ils"))
+        except (TypeError, ValueError):
+            raise ValidationError({"points_per_ils": "أدخل عدد النقاط التي تساوي شيكلاً واحداً."})
+        if per not in POINT_RATES:
+            raise ValidationError({"points_per_ils": "اختر 10 أو 20 أو 50 أو 100 نقطة لكل شيكل."})
+        models.Store.objects.filter(pk=store_id).update(points_per_ils=per)
+        return Response(self._payload(store_id))
 
     def put(self, request):
         store_id = request_pharmacy_id(request)
@@ -748,6 +765,11 @@ class EarnRulesView(APIView):
         return Response(self._payload(store_id))
 
 
+#: The rates a shop may pick (points per 1 ₪). Fixed steps, so a balance is
+#: always spent in whole shekels and never leaves an odd fraction.
+POINT_RATES = (10, 20, 50, 100)
+
+
 class PointsPreviewView(APIView):
     """What a bill of `amount` would earn — so the till can show it before
     the sale is rung, with the same arithmetic the server will use."""
@@ -764,7 +786,7 @@ class PointsPreviewView(APIView):
         return Response({
             "amount": str(amount),
             "rate_percent": str((rate * 100).quantize(CENT)),
-            "points": points_service.points_for(amount, rate=rate),
+            "points": points_service.points_for(amount, store=store_id, rate=rate),
         })
 
 

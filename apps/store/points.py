@@ -34,8 +34,22 @@ log = logging.getLogger(__name__)
 #: Fraction of the amount paid that comes back as value. 0.02 = 2%.
 EARN_RATE = Decimal(str(getattr(settings, "POINTS_EARN_RATE", "0.02")))
 
-#: How many points make one shekel. 10 means a point is worth 10 agorot.
+#: The DEFAULT number of points that make one shekel (10 = a point is worth
+#: 10 agorot). Each store may set its own (Store.points_per_ils); always ask
+#: per_ils(store), never read this directly for money.
 POINTS_PER_ILS = int(getattr(settings, "POINTS_PER_ILS", 10))
+
+
+def per_ils(store=None) -> int:
+    """How many points make one shekel in this store."""
+    if store is None:
+        return POINTS_PER_ILS
+    v = getattr(store, "points_per_ils", "missing")
+    if v == "missing":  # given an id
+        from apps.store.models import Store
+
+        v = Store.objects.filter(pk=store).values_list("points_per_ils", flat=True).first()
+    return int(v) if v else POINTS_PER_ILS
 
 
 def rate_for(store, amount) -> Decimal:
@@ -61,7 +75,7 @@ def rate_for(store, amount) -> Decimal:
     return EARN_RATE
 
 
-def points_for(amount, store=None, rate=None) -> int:
+def points_for(amount, store=None, rate=None, per=None) -> int:
     """Points earned on `amount` shekels of CASH paid.
 
     FLOOR, once, at the end: ₪17.50 at 2% is 3.5 points → 3. Rounding up would
@@ -73,21 +87,26 @@ def points_for(amount, store=None, rate=None) -> int:
     if amt <= 0:
         return 0
     r = rate if rate is not None else rate_for(store, amt)
-    raw = amt * Decimal(r) * POINTS_PER_ILS
+    raw = amt * Decimal(r) * (per or per_ils(store))
     return int(raw.to_integral_value(rounding=ROUND_FLOOR))
 
 
-def value_of(points: int) -> Decimal:
-    """What `points` are worth, in shekels."""
+def value_of(points: int, store=None, per=None) -> Decimal:
+    """What `points` are worth, in shekels, at the store's CURRENT rate.
+    For points already spent, read the bill's beans_value instead."""
     if not points or points <= 0:
         return Decimal("0.00")
-    return (Decimal(int(points)) / Decimal(POINTS_PER_ILS)).quantize(
+    return (Decimal(int(points)) / Decimal(per or per_ils(store))).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
 
 
-def max_spendable(balance: int, amount) -> int:
+def max_spendable(balance: int, amount, store=None) -> int:
     """Most points that may be applied to a bill of `amount`.
+
+    Points are only ever spent in WHOLE shekels: in steps of the store's rate
+    (10, 20, 30… when 10 points = 1 ₪), so a redemption is never 55 points =
+    5.50 ₪. The rest of the balance stays for next time.
 
     Bounded by BOTH the balance and the bill: points cannot buy more than the
     drink costs, and a redemption must never take a total below zero. Floor,
@@ -98,8 +117,9 @@ def max_spendable(balance: int, amount) -> int:
     amt = Decimal(str(amount))
     if amt <= 0:
         return 0
-    by_bill = int((amt * Decimal(POINTS_PER_ILS)).to_integral_value(rounding="ROUND_FLOOR"))
-    return max(0, min(int(balance), by_bill))
+    per = per_ils(store)
+    shekels = min(int(balance) // per, int(amt.to_integral_value(rounding=ROUND_FLOOR)))
+    return max(0, shekels * per)
 
 
 def balance_of(customer) -> int:
@@ -209,7 +229,7 @@ def award_for_purchase(store, customer, amount, *, source: str, source_id, cycle
     if customer is None:
         return 0
     rate = rate_for(store, amount)
-    points = points_for(amount, rate=rate)
+    points = points_for(amount, store=store, rate=rate)
     if points <= 0:
         return 0
 
@@ -262,8 +282,9 @@ def spend_on_purchase(store, customer, points: int, amount, *, source: str, sour
 
     from apps.store.models import BeanLedger
 
-    spend = max_spendable(balance_of(customer), amount)
-    spend = min(int(points), spend)
+    spend = max_spendable(balance_of(customer), amount, store)
+    per = per_ils(store)
+    spend = (min(int(points), spend) // per) * per  # whole shekels only
     if spend <= 0:
         return 0
 
@@ -299,10 +320,18 @@ def reverse_award(store, customer, amount, *, source: str, source_id, cycle: int
     """
     if customer is None:
         return 0
-    points = points_for(amount, store=store)
+    from apps.store.models import BeanLedger
+
+    # Take back exactly what was minted (the rate or bands may have changed
+    # since); recompute only if no award row exists.
+    minted = (
+        BeanLedger.objects.unscoped()
+        .filter(idempotency_key=_key("earn", source, source_id, cycle))
+        .values_list("delta", flat=True).first()
+    )
+    points = int(minted) if minted else points_for(amount, store=store)
     if points <= 0:
         return 0
-    from apps.store.models import BeanLedger
 
     _, applied = move(
         store, customer, -points, BeanLedger.Reason.ADJUST,

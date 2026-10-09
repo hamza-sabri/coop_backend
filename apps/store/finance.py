@@ -222,7 +222,7 @@ def _sales_block(store_id, lo, hi, shift):
     head = normal.aggregate(
         gross=Coalesce(Sum("total"), Value(ZERO, output_field=DEC)),
         net=Coalesce(Sum("discounted_total"), Value(ZERO, output_field=DEC)),
-        beans=Coalesce(Sum("beans_spent"), 0),
+        beans_value=Coalesce(Sum("beans_value"), Value(ZERO, output_field=DEC)),
         tickets=Count("id"),
     )
     legacy_returns = sales.filter(is_return=True).aggregate(
@@ -265,7 +265,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
 
     gross = q2(head["gross"])
     net_before_returns = q2(head["net"])
-    points_redeemed = q2(points_service.value_of(head["beans"] or 0))
+    points_redeemed = q2(head["beans_value"])
     discounts = q2(gross - net_before_returns - points_redeemed)
     if discounts < 0:
         # A price raised at the till shows up as a negative discount; keep it
@@ -383,7 +383,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
         LoyaltyProfile.objects.for_pharmacy(store_id).aggregate(n=Coalesce(Sum("beans"), 0))["n"] or 0
     )
     out["memo"]["points_outstanding"] = int(outstanding)
-    out["memo"]["points_outstanding_value"] = str(points_service.value_of(outstanding))
+    out["memo"]["points_outstanding_value"] = str(points_service.value_of(outstanding, store_id))
     purchases = models.StockMove.objects.for_pharmacy(store_id).filter(
         kind=models.StockMove.Kind.PURCHASE, created_at__gte=lo, created_at__lt=hi
     ).aggregate(n=Coalesce(Sum("total_cost"), Value(ZERO, output_field=DEC)))["n"]

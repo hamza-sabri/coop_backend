@@ -93,7 +93,9 @@ def sale_for_order(order, *, created_by=None):
         sale.recalculate_total(save=False)
         spent = int(order.beans_spent or 0)
         sale.beans_spent = spent
-        discounted = sale.total - points_service.value_of(spent)
+        # The order's own value: the rate at the moment the points were spent.
+        sale.beans_value = order.beans_value if spent else Decimal("0.00")
+        discounted = sale.total - sale.beans_value
         sale.discounted_total = discounted if discounted > 0 else Decimal("0.00")
         sale.save()
 

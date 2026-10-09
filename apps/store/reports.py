@@ -18,7 +18,6 @@ import re
 from datetime import timedelta
 from decimal import Decimal
 
-from django.conf import settings
 from django.db.models import (
     Case,
     Count,
@@ -768,6 +767,7 @@ def sales_summary(store_id: int, *, days: int = 30) -> dict:
         ),
         cash=Coalesce(Sum(signed_total, filter=Q(payment_method="cash")), zero),
         debt=Coalesce(Sum(signed_total, filter=Q(payment_method="debt")), zero),
+        card=Coalesce(Sum(signed_total, filter=Q(payment_method="card")), zero),
     )
     forward_count = max(agg["count"] - agg["returns_count"], 0)
     avg_basket = (agg["revenue"] / forward_count) if forward_count else Decimal("0")
@@ -822,7 +822,7 @@ def sales_summary(store_id: int, *, days: int = 30) -> dict:
         "count": agg["count"],
         "avg_basket": str(avg_basket.quantize(Decimal("0.01"))),
         "returns": {"count": agg["returns_count"], "value": str(agg["returns_value"])},
-        "payment_split": {"cash": str(agg["cash"]), "debt": str(agg["debt"])},
+        "payment_split": {"cash": str(agg["cash"]), "card": str(agg["card"]), "debt": str(agg["debt"])},
         "by_day": sales_by_day(store_id, days=days),
         "by_hour": [
             {"hour": r["h"], "total": str(r["total"]), "count": r["count"]}
@@ -1055,6 +1055,7 @@ def build_export_workbook(store, *, report: str, **opts):
         ws.append(["متوسط الفاتورة", data["avg_basket"]])
         ws.append(["مرتجعات", data["returns"]["count"], data["returns"]["value"]])
         ws.append(["نقدي", data["payment_split"]["cash"]])
+        ws.append(["بطاقة", data["payment_split"]["card"]])
         ws.append(["دين", data["payment_split"]["debt"]])
         for section, rows, headers in (
             ("حسب الموظف", data["by_employee"], ["الموظف", "الإيراد", "العمليات"]),
@@ -1288,7 +1289,9 @@ def cafe_summary(store_id: int, *, days: int = 30) -> dict:
             "id", filter=Q(reason=models.BeanLedger.Reason.REDEEM)
         ),
     )
-    per_ils = int(getattr(settings, "POINTS_PER_ILS", 10)) or 10
+    from apps.store import points as points_service
+
+    per_ils = points_service.per_ils(store_id)
     earned = int(points["earned"] or 0)
     spent = -int(points["spent"] or 0)
 

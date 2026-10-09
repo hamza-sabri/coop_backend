@@ -106,6 +106,11 @@ class Store(TimeStampedModel):
     #: Empty by default. Every shop builds its own — a default list would be a
     #: guess about a trade we know nothing about.
     pos_quick_groups = models.JSONField(default=list, blank=True)
+    #: How many loyalty points make one shekel (10 → a point is 10 agorot).
+    #: Null = the deployment default (settings.POINTS_PER_ILS). Changing it
+    #: changes what balances are WORTH from now on; every past redemption
+    #: keeps the shekel value it was given (Sale/Order.beans_value).
+    points_per_ils = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["name"]
@@ -630,7 +635,9 @@ class Sale(TimeStampedModel):
     balance and every existing debt flow keeps working unchanged.
     """
 
-    PAYMENT_CHOICES = [("cash", "Cash"), ("debt", "Debt")]
+    #: cash = into the drawer · card = paid by card (not in the drawer) ·
+    #: debt = on the customer's account (legacy; the café takes no credit).
+    PAYMENT_CHOICES = [("cash", "Cash"), ("card", "Card"), ("debt", "Debt")]
 
     store = models.ForeignKey(
         Store, related_name="sales", on_delete=models.CASCADE
@@ -659,6 +666,9 @@ class Sale(TimeStampedModel):
     #: REDEEM ledger row, kept here so a receipt can be reprinted months later
     #: without walking the ledger.
     beans_spent = models.IntegerField(default=0)
+    #: What those points were worth in shekels WHEN they were spent — so a
+    #: later change of the points rate never rewrites an old bill or report.
+    beans_value = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     # Frozen — computed from the line items, read-only on the API.
     total = models.DecimalField(
         max_digits=12, decimal_places=2, default=Decimal("0.00"), editable=False
@@ -1485,6 +1495,8 @@ class Order(TimeStampedModel):
     #: Beans redeemed against this order. The ledger row is the truth; this is
     #: the copy that lets a receipt be reprinted without recomputing history.
     beans_spent = models.PositiveIntegerField(default=0)
+    #: Their shekel value when redeemed (see Sale.beans_value).
+    beans_value = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     #: Same idempotency contract as Sale: a phone on a bad connection retries
     #: the POST, and must not end up with two identical orders.
     client_uuid = models.CharField(
@@ -2227,6 +2239,75 @@ class DemoMark(models.Model):
 
     def __str__(self):
         return f"{self.model}#{self.object_pk}"
+
+
+# ---------------------------------------------------------------------------
+# Cash drawer
+# ---------------------------------------------------------------------------
+class CashSession(TimeStampedModel):
+    """One opening-to-closing of the till's cash drawer.
+
+    Opened with the cash counted into it (the float). While open, what SHOULD
+    be in it is worked out from the books, never typed:
+
+        opening + cash sales − cash refunds + cash put in − cash taken out
+
+    Closed with the cash counted out of it; the difference is the answer to
+    "does the drawer match what we sold?". Expected is frozen at closing so a
+    later correction to an old invoice never changes a closed count.
+    """
+
+    store = models.ForeignKey(Store, related_name="cash_sessions", on_delete=models.CASCADE)
+    opened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    opened_at = models.DateTimeField(db_index=True)
+    opening_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    closed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    counted_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    expected_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-opened_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            # One open drawer per shop at a time.
+            models.UniqueConstraint(
+                fields=["store"], condition=models.Q(closed_at__isnull=True), name="one_open_cash_session"
+            )
+        ]
+
+    def __str__(self):
+        return f"صندوق {self.opened_at:%Y-%m-%d %H:%M}"
+
+
+class CashMove(TimeStampedModel):
+    """Cash put into or taken out of the drawer by hand — change brought from
+    the bank, milk paid for from the till. Signed: + in, − out."""
+
+    store = models.ForeignKey(Store, related_name="+", on_delete=models.CASCADE)
+    session = models.ForeignKey(CashSession, related_name="moves", on_delete=models.CASCADE)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    note = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
 
 
 # ---------------------------------------------------------------------------

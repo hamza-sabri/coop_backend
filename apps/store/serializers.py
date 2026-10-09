@@ -1002,9 +1002,8 @@ class SaleSerializer(serializers.ModelSerializer):
         return str(sum((r.refund_amount for r in self._returns(obj)), Decimal("0.00")))
 
     def get_beans_value(self, obj) -> str:
-        from apps.store import points as points_service
-
-        return str(points_service.value_of(obj.beans_spent or 0))
+        # What the points were worth when spent — never re-priced.
+        return str(obj.beans_value or Decimal("0.00"))
 
     def get_revision_count(self, obj) -> int:
         # Annotated on the list queryset so browsing history stays one query;
@@ -1207,9 +1206,10 @@ class SaleSerializer(serializers.ModelSerializer):
                         )
                         if spent > 0:
                             sale.beans_spent = spent
+                            sale.beans_value = points_service.value_of(spent, sale.store)
                             sale.discounted_total = (
                                 sale.discounted_total
-                                - points_service.value_of(spent)
+                                - sale.beans_value
                             )
                             if sale.discounted_total < 0:
                                 sale.discounted_total = Decimal("0.00")
@@ -1723,14 +1723,13 @@ class OrderSerializer(serializers.ModelSerializer):
         return list(models.Order.TRANSITIONS.get(obj.status, ()))
 
     def get_beans_value(self, obj) -> str:
-        from apps.store import points as points_service
-
-        return str(points_service.value_of(obj.beans_spent or 0))
+        # What the points were worth when spent — never re-priced.
+        return str(obj.beans_value or Decimal("0.00"))
 
     def get_cash_total(self, obj) -> str:
         from apps.store import points as points_service
 
-        due = (obj.total or Decimal("0")) - points_service.value_of(obj.beans_spent or 0)
+        due = (obj.total or Decimal("0")) - (obj.beans_value or Decimal("0"))
         return str(due if due > 0 else Decimal("0.00"))
 
     def create(self, validated):
