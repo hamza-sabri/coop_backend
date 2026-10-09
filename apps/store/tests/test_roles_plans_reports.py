@@ -79,12 +79,13 @@ class PlanModulesTests(TestCase):
             name="B", slug="pl-basic", plan=plan, enabled_modules=["reports"]
         )
         self.assertEqual(
-            pharmacy_modules(p), frozenset({"pos", "inventory", "reports"})
+            # "stock" comes with "inventory" (it was split out of it).
+            pharmacy_modules(p), frozenset({"pos", "inventory", "stock", "reports"})
         )
         # An empty extras list with a plan means JUST the plan — no legacy
         # "empty = everything" surprise.
         p.enabled_modules = []
-        self.assertEqual(pharmacy_modules(p), frozenset({"pos", "inventory"}))
+        self.assertEqual(pharmacy_modules(p), frozenset({"pos", "inventory", "stock"}))
 
     def test_inactive_plan_falls_back_to_legacy(self):
         plan = models.Plan.objects.create(name="X", modules=["pos"], is_active=False)

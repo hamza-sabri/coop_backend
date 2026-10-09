@@ -484,3 +484,35 @@ class CustomersReportAvatarTests(RecipeBase):
             today = finance.today()
             d = breakdowns.customers_report(self.store.pk, today, today)
         self.assertEqual(d["top"][0]["avatar"], "https://signed/faces/r.jpg")
+
+
+class StaffDeleteAndPagesTests(RecipeBase):
+    def test_delete_only_without_invoices_and_never_superusers_listed(self):
+        temp = User.objects.create_user(username="temp", password="x", store=self.store, role="employee")
+        self.assertEqual(self.api.delete(f"/api/v1/staff/{temp.pk}/").status_code, 204)
+        self.assertFalse(User.objects.filter(pk=temp.pk).exists())
+        self.sell(1, client=self.staff)  # the employee now has an invoice
+        r = self.api.delete(f"/api/v1/staff/{self.emp.pk}/")
+        self.assertEqual(r.status_code, 400)
+        self.assertTrue(User.objects.filter(pk=self.emp.pk).exists())
+        self.assertEqual(self.api.delete(f"/api/v1/staff/{self.owner.pk}/").status_code, 400)
+        root = User.objects.create_user(username="root9", password="x", store=self.store, is_superuser=True)
+        su = APIClient()
+        su.force_authenticate(root)
+        body = su.get("/api/v1/staff/").json()
+        body = body.get("data", body)
+        rows = body.get("results", body) if isinstance(body, dict) else body
+        self.assertNotIn("root9", [u["username"] for u in rows])
+
+    def test_menu_and_stock_are_separate_switches(self):
+        self.emp.allowed_modules = ["pos"]
+        self.emp.save()
+        # A POS-only cashier still lists the menu and categories to sell from…
+        self.assertEqual(self.staff.get("/api/v1/products/").status_code, 200)
+        self.assertEqual(self.staff.get("/api/v1/categories/").status_code, 200)
+        # …but cannot change a drink or open the stock.
+        self.assertEqual(self.staff.patch(f"/api/v1/products/{self.latte.pk}/", {"price": "1"}, format="json").status_code, 403)
+        self.assertEqual(self.staff.get("/api/v1/inventory-items/").status_code, 403)
+        self.emp.allowed_modules = ["pos", "stock"]
+        self.emp.save()
+        self.assertEqual(self.staff.get("/api/v1/inventory-items/").status_code, 200)

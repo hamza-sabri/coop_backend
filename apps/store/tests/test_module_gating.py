@@ -73,7 +73,8 @@ class EffectiveModulesTests(ModuleFixtureMixin, TestCase):
         self.assertEqual(effective_modules(self.user_full), ALL_MODULES - {"online_orders"})
 
     def test_pharmacy_list_limits(self):
-        self.assertEqual(effective_modules(self.user_pos), frozenset({"pos", "inventory"}))
+        # "stock" was split out of "inventory": a shop with the menu has it.
+        self.assertEqual(effective_modules(self.user_pos), frozenset({"pos", "inventory", "stock"}))
 
     def test_user_list_intersects_with_pharmacy(self):
         self.assertEqual(effective_modules(self.user_cashier), frozenset({"pos"}))
@@ -157,7 +158,9 @@ class UserLevelGatingTests(ModuleFixtureMixin, TestCase):
         self.assertEqual(
             self.CASHIER.get("/api/v1/products/pos_catalog/").status_code, 200
         )
-        self.assertEqual(self.CASHIER.get("/api/v1/products/").status_code, 403)
+        # Reading the menu is part of selling; changing it is not.
+        self.assertEqual(self.CASHIER.get("/api/v1/products/").status_code, 200)
+        self.assertEqual(self.CASHIER.post("/api/v1/products/", {"name": "x", "price": "1"}).status_code, 403)
         self.assertEqual(self.CASHIER.get("/api/v1/debts/").status_code, 403)
         # Customer profiles are shared plumbing for POS credit sales.
         self.assertEqual(self.CASHIER.get("/api/v1/customers/").status_code, 200)

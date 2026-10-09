@@ -243,7 +243,8 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
     queryset = models.InventoryItem.objects.unscoped()
     serializer_class = InventoryItemSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ModuleEnabled]
+    required_module = "stock"
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     OWNER_ACTIONS = {"destroy", "purchase", "insights"}
@@ -905,7 +906,8 @@ class InventoryCategoryViewSet(OwnerWritesMixin, StoreScopedMixin, viewsets.Mode
 
     queryset = models.InventoryCategory.objects.unscoped()
     serializer_class = InventoryCategorySerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, ModuleEnabled]
+    required_module = "stock"
     pagination_class = None
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 

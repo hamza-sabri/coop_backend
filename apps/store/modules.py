@@ -20,7 +20,10 @@ from __future__ import annotations
 
 # key -> Arabic label (shown in admin / tiers page copy)
 MODULES: dict[str, str] = {
-    "inventory": "المخزون والأدوية",
+    "inventory": "المنيو",
+    # The raw-materials page (المخزون): its own switch so an employee can be
+    # given the menu without the stock, or the other way round.
+    "stock": "المخزون",
     "pos": "نقطة البيع",
     "customers": "الزبائن",
     "debts": "الديون والدفاتر",
@@ -81,6 +84,10 @@ def pharmacy_modules(store) -> frozenset:
 
     if not getattr(settings, "ONLINE_ORDERS_ENABLED", False):
         mods = mods - {"online_orders"}
+    # "stock" was split out of "inventory": a shop that has the menu has the
+    # stock page, whatever an older plan list says.
+    if "inventory" in mods:
+        mods = mods | {"stock"}
     return mods
 
 

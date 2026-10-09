@@ -397,7 +397,9 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     # Inventory management needs the inventory module; the POS catalogue
     # action belongs to the POS module (a POS-only cashier can sell without
     # being able to edit the med list).
-    MODULE_BY_ACTION = {"pos_catalog": "pos"}
+    # READING the menu belongs to anyone who sells from it: the till lists
+    # products through the same endpoints. Changing it needs "inventory".
+    MODULE_BY_ACTION = {"pos_catalog": "pos", "list": ("pos", "inventory"), "retrieve": ("pos", "inventory")}
 
     @property
     def required_module(self):
@@ -1016,8 +1018,13 @@ class MedicationVariantViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     )
     serializer_class = serializers.ProductVariantSerializer
     permission_classes = [permissions.IsAuthenticated, ModuleEnabled]
-    required_module = "inventory"
     filterset_class = MedicationVariantFilter
+
+    @property
+    def required_module(self):
+        # Sizes are read by the till; only editing them is the menu's.
+        return ("pos", "inventory") if getattr(self, "action", None) in ("list", "retrieve") else "inventory"
+
     ordering_fields = ["label", "price", "stock", "created_at"]
     ordering = ["label"]
 
@@ -2411,8 +2418,13 @@ class _TaxonomyViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, ModuleEnabled]
-    required_module = "inventory"
     search_fields = ["name"]
+
+    @property
+    def required_module(self):
+        # The till's category circles read these; creating one is the menu's.
+        return ("pos", "inventory") if getattr(self, "action", None) in ("list", "retrieve") else "inventory"
+
     ordering_fields = ["name", "count", "created_at"]
     ordering = ["-count", "name"]
 
@@ -3994,9 +4006,10 @@ class StaffViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, OwnerRequired, StoreResolved]
-    # No PUT (full replace) and no DELETE (hard delete) — edits are PATCH,
-    # removal is a soft is_active=False toggle.
-    http_method_names = ["get", "post", "patch", "head", "options"]
+    # No PUT (full replace). DELETE removes an account that never rang a sale
+    # (a mistake, a test login); anyone with history is switched off instead,
+    # so every past invoice keeps the name of whoever rang it.
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_serializer_class(self):
         from apps.accounts.serializers import StaffSerializer
@@ -4007,12 +4020,29 @@ class StaffViewSet(viewsets.ModelViewSet):
         from apps.accounts.models import User
 
         pid = request_pharmacy_id(self.request)
-        qs = User.objects.filter(store_id=pid)
-        if not self.request.user.is_superuser:
-            # The platform's own accounts are not the shop's staff: an owner
-            # sees, edits and deactivates their people — never ours.
-            qs = qs.filter(is_superuser=False)
+        # The platform's own accounts are not the shop's staff and never appear
+        # here — not even to a platform account looking at the shop.
+        qs = User.objects.filter(store_id=pid, is_superuser=False)
         return qs.order_by("-role", "username")
+
+    def perform_destroy(self, instance):
+        from rest_framework.exceptions import ValidationError
+
+        from apps.accounts.models import User
+
+        if instance.pk == self.request.user.pk:
+            raise ValidationError({"detail": "لا يمكنك حذف حسابك."})
+        if instance.role == User.Role.OWNER and not (
+            User.objects.filter(store_id=instance.store_id, role=User.Role.OWNER, is_active=True, is_superuser=False)
+            .exclude(pk=instance.pk)
+            .exists()
+        ):
+            raise ValidationError({"detail": "يجب أن يبقى مالك واحد على الأقل."})
+        if models.Sale.objects.for_pharmacy(instance.store_id).filter(created_by_id=instance.pk).exists():
+            raise ValidationError(
+                {"detail": "له فواتير مسجّلة باسمه — أوقف حسابه بدل حذفه، لتبقى الفواتير باسمه."}
+            )
+        instance.delete()
 
     @action(detail=False, methods=["get"], url_path="board")
     def board(self, request):

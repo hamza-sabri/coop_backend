@@ -194,7 +194,8 @@ class StaffApiTests(TenantFixtureMixin, TestCase):
         self.assertEqual(res.status_code, 400)
 
     # ── no hard delete ────────────────────────────────────────────────────
-    def test_hard_delete_disabled(self):
+    def test_delete_only_an_account_with_no_invoices(self):
+        # No sales yet → the account can go (a mistake, a test login).
         res = self.A.delete(f"{STAFF}{self.emp_a.pk}/")
-        self.assertEqual(res.status_code, 405)
-        self.assertTrue(User.objects.filter(pk=self.emp_a.pk).exists())
+        self.assertEqual(res.status_code, 204)
+        self.assertFalse(User.objects.filter(pk=self.emp_a.pk).exists())
