@@ -2230,6 +2230,34 @@ class DemoMark(models.Model):
 
 
 # ---------------------------------------------------------------------------
+# Suppliers
+# ---------------------------------------------------------------------------
+class Supplier(TimeStampedModel):
+    """Who the café buys from (ألبان الجنيدي، محمصة النورس…), picked from a
+    dropdown on a stock item. Like InventoryCategory, InventoryItem.supplier
+    holds the NAME, so a rename here is carried onto the items by the API and
+    old offline-queued saves (plain text) keep working."""
+
+    store = models.ForeignKey(Store, related_name="suppliers", on_delete=models.CASCADE)
+    name = models.CharField(max_length=120)
+    phone = models.CharField(max_length=32, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["name"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(fields=["store", "name"], name="uniq_supplier_name")
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+# ---------------------------------------------------------------------------
 # Inventory categories + recipes
 # ---------------------------------------------------------------------------
 class InventoryCategory(TimeStampedModel):

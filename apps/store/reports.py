@@ -36,6 +36,8 @@ from django.db.models import (
 from django.db.models.functions import Coalesce, Length, TruncDate
 from django.utils import timezone
 
+from apps.core.search import text_q
+
 from . import models
 
 # issue key -> Arabic label. Grouped: pricing, stock, barcode, data hygiene.
@@ -399,7 +401,7 @@ def build_filtered_queryset(
         )
     if search:
         qs = qs.filter(
-            Q(name__icontains=search)
+            text_q("name", search)
             | Q(barcode__istartswith=search)
             | Q(alt_barcodes__icontains=f'"{search}')
         )

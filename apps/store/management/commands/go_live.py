@@ -7,12 +7,14 @@ Goes:
   sales, returns, invoice history, app orders, customers, points, debts,
   stock movements, expenses (one-off AND monthly), notifications, logs,
   the demo employees and demo shifts the showcase made, their photos,
-  the open POS carts, and the drink costs the showcase invented (put back
+  the open POS carts, supplier names typed on items before the supplier
+  list existed (and the showcase's suppliers), and the drink costs the showcase invented (put back
   to what they were before it — usually empty, so the owner types the real
   ones; pass --keep-demo-costs to leave them).
 
 Stays:
   the menu (drinks, sizes, pictures, categories), the POS quick cards,
+  suppliers the shop added to its list,
   the inventory items (stock set to 0, expiry dates cleared), recipes,
   points tiers, expense categories, shifts the shop made itself, the
   owner's and real employees' accounts, the store's settings.
@@ -61,6 +63,12 @@ class Command(BaseCommand):
         recurring_q = models.RecurringExpense.unguarded.filter(store_id=store.pk)
         carts_q = models.PosCartState.objects.filter(user__store=store)
         items_q = models.InventoryItem.unguarded.filter(store_id=store.pk)
+        demo_suppliers = [m["object_pk"] for m in marks if m["model"] == "store.Supplier"]
+        suppliers_q = models.Supplier.unguarded.filter(store_id=store.pk, pk__in=demo_suppliers)
+        known = models.Supplier.unguarded.filter(store_id=store.pk).exclude(pk__in=demo_suppliers)
+        # A supplier name typed before the list existed (or a showcase one) is
+        # cleared; one picked from the shop's own list stays.
+        loose_q = items_q.exclude(supplier="").exclude(supplier__in=known.values("name"))
         uids = reset_service.firebase_uids(store)
 
         self.stdout.write(self.style.WARNING(f"\n{store.name} ({store.slug}) — will delete:"))
@@ -76,6 +84,7 @@ class Command(BaseCommand):
         else:
             self.stdout.write(f"  تكاليف المشروبات التجريبية تعود كما كانت: {len(costs)}")
         self.stdout.write(f"  أصناف المخزون تبقى ويُصفَّر رصيدها: {items_q.count()}")
+        self.stdout.write(f"  الموردون التجريبيون: {suppliers_q.count()} · أصناف يُمسح موردها: {loose_q.count()}")
         self.stdout.write(f"  حسابات فايربيس: {len(uids) if o['firebase'] else 'لا (أضف --firebase)'}")
         self.stdout.write("\nيبقى: المنيو والصور والتصنيفات، أصناف المخزون والوصفات، شرائح النقاط، "
                           "تصنيفات المصاريف، حساب المالك والموظفين الحقيقيين، إعدادات المتجر.")
@@ -97,6 +106,8 @@ class Command(BaseCommand):
             # Shifts and staff after the sales that pointed at them are gone.
             n_shifts, _ = shifts_q.delete()
             n_users, _ = users_q.delete()
+            loose_q.update(supplier="")
+            suppliers_q.delete()
             items_q.update(stock=0, expiry_date=None)
 
         from django.core.files.storage import default_storage

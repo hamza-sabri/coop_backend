@@ -577,8 +577,8 @@ class Command(BaseCommand):
                     store=self.store, name=name, category=cat, purchase_qty=pqty,
                     purchase_unit=unit, purchase_cost=Decimal(pcost), reorder_level=Decimal(reorder),
                     expiry_date=(start + timedelta(days=life)) if life else None,
-                    supplier={"ألبان": "ألبان الجنيدي", "فواكه": "سوق الخضار", "قهوة": "محمصة النورس",
-                              "سيرب": "تموين قلقيلية", "جاف": "تموين قلقيلية"}.get(cat, "مطبعة الأمل للتغليف"),
+                    supplier=self._supplier({"ألبان": "ألبان الجنيدي", "فواكه": "سوق الخضار", "قهوة": "محمصة النورس",
+                                             "سيرب": "تموين قلقيلية", "جاف": "تموين قلقيلية"}.get(cat, "مطبعة الأمل للتغليف")),
                 )
                 self.mark.add(item)
                 from apps.store.cafe_api import _apply_move
@@ -588,6 +588,14 @@ class Command(BaseCommand):
             out[name] = item
             self.sim[name] = {"daily": Decimal(daily), "unit": unit, "pqty": pqty, "pcost": pcost, "life": life}
         return out
+
+    def _supplier(self, name):
+        """A showcase supplier, registered so the purge removes it — unless
+        the shop already had one by that name."""
+        sup, made = models.Supplier.objects.get_or_create(store=self.store, name=name)
+        if made:
+            self.mark.add(sup)
+        return name
 
     def _recipes(self, products) -> int:
         """A believable recipe for every drink on the menu, by what its name

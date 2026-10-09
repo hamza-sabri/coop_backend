@@ -12,13 +12,14 @@ from datetime import date, timedelta
 from decimal import ROUND_FLOOR, Decimal
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
 from rest_framework import permissions, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.search import text_q
 from apps.core.permissions import ModuleEnabled, OwnerRequired, StoreResolved
 from apps.store import finance, models
 from apps.store import points as points_service
@@ -259,7 +260,8 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         qs = super().get_queryset()
         p = self.request.query_params
         if p.get("search"):
-            qs = qs.filter(Q(name__icontains=p["search"]) | Q(category__icontains=p["search"]) | Q(supplier__icontains=p["search"]))
+            t = p["search"]
+            qs = qs.filter(text_q("name", t) | text_q("category", t) | text_q("supplier", t))
         if p.get("category"):
             qs = qs.filter(category=p["category"])
         if p.get("active") != "all":
@@ -277,6 +279,7 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         if not _is_owner(self.request.user):
             serializer.validated_data.pop("purchase_cost", None)
         item = serializer.save(store_id=self.store_id)
+        _remember_supplier(self.store_id, item.supplier)
         if opening:
             base = models.InventoryItem.to_base(opening, item.purchase_unit)
             # An opening balance is not a count difference: ADJUST, so the
@@ -286,7 +289,8 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         serializer.validated_data.pop("opening_stock", None)
-        serializer.save()
+        item = serializer.save()
+        _remember_supplier(self.store_id, item.supplier)
 
     def perform_destroy(self, instance):
         used = list(
@@ -344,7 +348,8 @@ class InventoryItemViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             if d.get("expiry_date"):
                 item.expiry_date = finance._parse(d.get("expiry_date"))
             if d.get("supplier"):
-                item.supplier = str(d.get("supplier"))[:255]
+                item.supplier = str(d.get("supplier")).strip()[:120]
+                _remember_supplier(self.store_id, item.supplier)
             item.save()
             move = _apply_move(
                 item, models.StockMove.Kind.PURCHASE,
@@ -942,6 +947,72 @@ class InventoryCategoryViewSet(OwnerWritesMixin, StoreScopedMixin, viewsets.Mode
         if models.InventoryItem.objects.for_pharmacy(self.store_id).filter(category=instance.name).exists():
             raise ValidationError({"detail": "التصنيف مستخدم لأصناف — انقلها لتصنيف آخر أولاً."})
         instance.delete()
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.Supplier
+        fields = ["id", "name", "phone", "items"]
+
+    def get_items(self, obj) -> int:
+        counts = self.context.get("supplier_counts")
+        if counts is None:
+            counts = self.context["supplier_counts"] = dict(
+                models.InventoryItem.objects.for_pharmacy(obj.store_id).exclude(supplier="")
+                .values_list("supplier").annotate(n=Count("pk")).values_list("supplier", "n")
+            )
+        return counts.get(obj.name, 0)
+
+    def validate_name(self, v):
+        v = (v or "").strip()
+        if not v:
+            raise serializers.ValidationError("أدخل اسم المورّد.")
+        return v[:120]
+
+
+class SupplierViewSet(OwnerWritesMixin, StoreScopedMixin, viewsets.ModelViewSet):
+    """The supplier list behind the dropdown on a stock item. Renaming one
+    renames it on every item; deleting one leaves its items with no supplier."""
+
+    queryset = models.Supplier.objects.unscoped()
+    serializer_class = SupplierSerializer
+    permission_classes = [permissions.IsAuthenticated, ModuleEnabled]
+    required_module = "stock"
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        found = models.Supplier.objects.for_pharmacy(self.store_id).filter(name=name).first()
+        if found:
+            serializer.instance = found
+            return
+        serializer.save(store_id=self.store_id)
+
+    def perform_update(self, serializer):
+        old = serializer.instance.name
+        new = serializer.validated_data.get("name", old)
+        if new != old and models.Supplier.objects.for_pharmacy(self.store_id).filter(name=new).exists():
+            raise ValidationError({"name": "يوجد مورّد بهذا الاسم."})
+        with transaction.atomic():
+            sup = serializer.save()
+            if sup.name != old:
+                models.InventoryItem.objects.for_pharmacy(self.store_id).filter(supplier=old).update(supplier=sup.name)
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            models.InventoryItem.objects.for_pharmacy(self.store_id).filter(supplier=instance.name).update(supplier="")
+            instance.delete()
+
+
+def _remember_supplier(store_id, name):
+    """An item saved with a supplier the list does not have yet (typed on an
+    old screen, or queued offline) adds it, so the dropdown never misses one."""
+    name = (name or "").strip()[:120]
+    if name:
+        models.Supplier.objects.get_or_create(store_id=store_id, name=name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

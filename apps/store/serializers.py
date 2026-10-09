@@ -599,7 +599,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
 
     def get_signed_up(self, obj) -> bool:
         """Did they come in through the app, or add at the counter?"""
-        return bool(obj.clerk_id)
+        return bool(obj.clerk_id or obj.firebase_uid)
 
 class DebtItemSerializer(serializers.ModelSerializer):
     """A single med line inside a debt. `line_total` is computed server-side."""

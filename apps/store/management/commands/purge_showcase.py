@@ -28,6 +28,7 @@ ORDER = [
     ("store.Customer", "الزبائن"),
     ("store.RecipeLine", "سطور الوصفات"),
     ("store.InventoryItem", "أصناف المخزون (وحركاتها)"),
+    ("store.Supplier", "الموردون"),
     ("store.Expense", "المصاريف"),
     ("store.RecurringExpense", "المصاريف الشهرية الثابتة"),
     ("store.Shift", "الورديات"),

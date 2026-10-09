@@ -516,3 +516,96 @@ class StaffDeleteAndPagesTests(RecipeBase):
         self.emp.allowed_modules = ["pos", "stock"]
         self.emp.save()
         self.assertEqual(self.staff.get("/api/v1/inventory-items/").status_code, 200)
+
+
+class SupplierTests(RecipeBase):
+    """Suppliers are a list the stock item picks from; the item keeps the name."""
+
+    def rows(self, r):
+        body = r.json()
+        body = body.get("data", body) if isinstance(body, dict) else body
+        return body.get("results", body) if isinstance(body, dict) else body
+
+    def test_create_pick_rename_delete(self):
+        r = self.api.post("/api/v1/suppliers/", {"name": " ألبان الجنيدي ", "phone": "0599"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        sid = self.rows(r)["id"]
+        # Same name again → the same row, not a duplicate.
+        self.api.post("/api/v1/suppliers/", {"name": "ألبان الجنيدي"}, format="json")
+        self.assertEqual(models.Supplier.objects.for_pharmacy(self.store).count(), 1)
+
+        item = models.InventoryItem.objects.create(store=self.store, name="حليب", purchase_unit="l")
+        self.assertEqual(self.api.patch(f"/api/v1/inventory-items/{item.pk}/", {"supplier": "ألبان الجنيدي"},
+                                        format="json").status_code, 200)
+        listed = self.rows(self.api.get("/api/v1/suppliers/"))
+        self.assertEqual(listed[0]["items"], 1)
+
+        self.api.patch(f"/api/v1/suppliers/{sid}/", {"name": "الجنيدي"}, format="json")
+        item.refresh_from_db()
+        self.assertEqual(item.supplier, "الجنيدي", "a rename follows onto the items")
+
+        self.assertEqual(self.api.delete(f"/api/v1/suppliers/{sid}/").status_code, 204)
+        item.refresh_from_db()
+        self.assertEqual(item.supplier, "")
+
+    def test_typed_supplier_joins_the_list_and_employees_only_read(self):
+        item = models.InventoryItem.objects.create(store=self.store, name="بن", purchase_unit="kg")
+        self.api.patch(f"/api/v1/inventory-items/{item.pk}/", {"supplier": "محمصة النورس"}, format="json")
+        self.assertTrue(models.Supplier.objects.for_pharmacy(self.store).filter(name="محمصة النورس").exists())
+        self.assertEqual(self.staff.get("/api/v1/suppliers/").status_code, 200)
+        self.assertEqual(self.staff.post("/api/v1/suppliers/", {"name": "x"}, format="json").status_code, 403)
+
+
+class ArabicSearchTests(RecipeBase):
+    """أ = إ = آ = ا, ة = ه, ى = ي in every server search, like the app's boxes."""
+
+    def rows(self, url):
+        r = self.api.get(url)
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json()
+        body = body.get("data", body) if isinstance(body, dict) else body
+        return body.get("results", body) if isinstance(body, dict) else body
+
+    def test_pattern(self):
+        import re
+
+        from apps.core.search import arabic_pattern
+
+        p = arabic_pattern("اسبريسو")
+        for name in ("إسبريسو", "أسبريسو", "آسبريسو", "اسبريسو مزدوج", "إِسبريسو"):
+            self.assertTrue(re.search(p, name), name)
+        self.assertFalse(re.search(arabic_pattern("قهوه"), "قهوى"))
+        self.assertTrue(re.search(arabic_pattern("قهوه"), "قهوة تركية"))
+
+    def test_customers_products_and_stock(self):
+        models.Customer.objects.create(store=self.store, name="أحمد خالد", phone="0591112223")
+        models.Product.objects.create(store=self.store, name="إسبريسو", price="8")
+        models.InventoryItem.objects.create(store=self.store, name="قهوة إثيوبية", purchase_unit="kg")
+        self.assertEqual([c["name"] for c in self.rows("/api/v1/customers/?search=احمد")], ["أحمد خالد"])
+        self.assertEqual(len(self.rows("/api/v1/customers/?search=٠٥٩١١")), 1, "Arabic-Indic digits")
+        self.assertIn("إسبريسو", [p["name"] for p in self.rows("/api/v1/products/?search=اسبريسو")])
+        self.assertEqual([i["name"] for i in self.rows("/api/v1/inventory-items/?search=قهوه اثيوبيه")], ["قهوة إثيوبية"])
+
+
+class TillCustomerListTests(RecipeBase):
+    """A customer who signs up in the app shows at the till straight away."""
+
+    def quick(self):
+        body = self.api.get("/api/v1/customers/quick/").json()
+        body = body.get("data", body)
+        return body["results"]
+
+    def test_app_signup_reaches_the_till_list(self):
+        from django.core.cache import cache
+
+        from apps.accounts.firebase import upsert_customer_from_firebase
+
+        cache.clear()
+        before = {c["id"] for c in self.quick()}  # caches the list
+        with self.captureOnCommitCallbacks(execute=True):
+            cust = upsert_customer_from_firebase(self.store, {"sub": "fb-1", "name": "hamza sabri"})
+        rows = {c["id"]: c for c in self.quick()}
+        self.assertNotIn(cust.pk, before)
+        self.assertIn(cust.pk, rows)
+        self.assertTrue(rows[cust.pk]["signed_up"])
+        self.assertEqual(rows[cust.pk]["beans"], 5)

@@ -22,6 +22,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 import django_filters
 
+from apps.core.search import ArabicSearchFilter, text_q
 from apps.core.permissions import (
     ModuleEnabled,
     OwnerRequired,
@@ -112,7 +113,7 @@ class SaleFilter(django_filters.FilterSet):
 
         # Text still searches what a person would mean by it.
         return queryset.filter(
-            Q(items__medication_name__icontains=value)
+            text_q("items__medication_name", value)
             | Q(items__product__barcode__icontains=value)
         ).distinct()
 
@@ -1138,7 +1139,7 @@ class PublicPriceCheckView(APIView):
         meds = list(
             models.Product.objects.for_pharmacy(pid)
             .filter(
-                Q(name__icontains=q)
+                text_q("name", q)
                 | Q(barcode__istartswith=q)
                 | Q(alt_barcodes__icontains=f'"{q}')
             )
@@ -2555,7 +2556,7 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 ),
                 beans=Coalesce(F("loyalty__beans"), 0),
             )
-            .values("id", "name", "phone", "avatar", "gender", "clerk_id", "created_at",
+            .values("id", "name", "phone", "avatar", "gender", "clerk_id", "firebase_uid", "created_at",
                     "visits", "visits_30", "first_at", "last_at", "spent", "beans")
         )
         rows = []
@@ -2568,7 +2569,7 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             row = {
                 "id": c["id"], "name": c["name"], "phone": c["phone"] or "",
                 "avatar": resolve_stored_url(c["avatar"]), "gender": c["gender"],
-                "app": bool(c["clerk_id"]), "visits": c["visits"], "visits_30d": c["visits_30"],
+                "app": bool(c["clerk_id"] or c["firebase_uid"]), "visits": c["visits"], "visits_30d": c["visits_30"],
                 "last_visit": last.isoformat() if last else None, "days_since": since,
                 "joined": joined.isoformat(), "points": int(c["beans"] or 0),
                 "status": customer_status(c["visits"], (today - joined).days, since, c["visits_30"], gap),
@@ -2607,11 +2608,11 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 "beans": c["loyalty__beans"] or 0,
                 # Someone who signed up in the app: the till sorts these first,
                 # because they are the ones whose points actually move.
-                "signed_up": bool(c["clerk_id"]),
+                "signed_up": bool(c["clerk_id"] or c["firebase_uid"]),
             }
             for c in self.get_queryset().values(
                 "id", "name", "phone", "outstanding", "avatar",
-                "loyalty__beans", "clerk_id",
+                "loyalty__beans", "clerk_id", "firebase_uid",
             )
         ]
         payload = {"count": len(rows), "results": rows}
@@ -4852,7 +4853,7 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     filter_backends = [
         django_filters.rest_framework.DjangoFilterBackend,
         filters.OrderingFilter,
-        filters.SearchFilter,
+        ArabicSearchFilter,
     ]
     # ?customer= is what a customer profile needs; ?status= is what the queue
     # needs. Without a filter backend both were silently ignored and every

@@ -261,7 +261,7 @@ REST_FRAMEWORK = {
     "PAGE_SIZE": int(os.getenv("PAGE_SIZE", "30")),
     "DEFAULT_FILTER_BACKENDS": (
         "django_filters.rest_framework.DjangoFilterBackend",
-        "rest_framework.filters.SearchFilter",
+        "apps.core.search.ArabicSearchFilter",
         "rest_framework.filters.OrderingFilter",
     ),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",

@@ -125,6 +125,9 @@ class GoLiveTests(TestCase):
         self.assertEqual(self.typed.image, "x.jpg")
         self.assertEqual(self.blank.cost, Decimal("0"), "an invented cost is put back")
         self.assertTrue(models.Category.objects.for_pharmacy(st).exists())
+        # Showcase suppliers go, and no item keeps a showcase supplier name.
+        self.assertFalse(models.Supplier.unguarded.filter(store_id=st.pk).exists())
+        self.assertFalse(models.InventoryItem.unguarded.filter(store_id=st.pk).exclude(supplier="").exists())
         self.assertTrue(models.EarnRule.objects.for_pharmacy(st).exists())
         self.assertTrue(models.ExpenseCategory.objects.for_pharmacy(st).exists())
         items = models.InventoryItem.objects.for_pharmacy(st)
