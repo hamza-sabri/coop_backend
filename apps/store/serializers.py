@@ -11,6 +11,19 @@ from . import models
 _UNSET = object()
 
 
+def _billed(total, discounted):
+    """What the bill comes to. The cashier may take money OFF (a discount)
+    or round up to the next whole shekel — never more than that. A slipped
+    digit in the total box once rang up ₪1,200,000 and minted points on it."""
+    total = Decimal(total or 0)
+    if discounted is _UNSET or discounted is None:
+        return total
+    v = Decimal(discounted)
+    ceiling = total.to_integral_value(rounding="ROUND_CEILING")
+    return min(max(v, Decimal("0.00")), ceiling).quantize(Decimal("0.01"))
+
+
+
 class SaleDebtMirrorError(serializers.ValidationError):
     """A credit sale finished without its mirrored Debt.
 
@@ -1184,9 +1197,7 @@ class SaleSerializer(serializers.ModelSerializer):
                             stock=F("stock") + delta * row["quantity"]
                         )
                 sale.recalculate_total(save=False)
-                sale.discounted_total = (
-                    sale.total if discounted is _UNSET else Decimal(discounted)
-                )
+                sale.discounted_total = _billed(sale.total, discounted)
 
                 # ── loyalty ──────────────────────────────────────────
                 # Redeem FIRST so the discount lands on the bill, then earn on
@@ -1488,9 +1499,7 @@ class SaleSerializer(serializers.ModelSerializer):
             sale.total = sum(
                 (i.line_total for i in created), Decimal("0.00")
             ).quantize(Decimal("0.01"))
-            sale.discounted_total = (
-                sale.total if discounted is _UNSET else Decimal(discounted)
-            )
+            sale.discounted_total = _billed(sale.total, discounted)
 
             # 4. The customer's balance has to follow the sale.
             self._rebuild_debt(sale, rows, sale.created_by)

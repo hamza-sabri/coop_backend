@@ -740,3 +740,49 @@ class TillCatalogPictureTests(RecipeBase):
             body = self.api.get("/api/v1/products/pos_catalog/").json()
             rows = {r["id"]: r for r in body.get("data", body)["results"]}
             self.assertEqual(rows[self.latte.pk]["image"], "https://img.example/latte.webp")
+
+
+class VoidedSalePointsTests(RecipeBase):
+    """A deleted bill takes its points with it; a typed total can only go
+    down (or round up to the next shekel); the owner can remove any amount."""
+
+    def setUp(self):
+        super().setUp()
+        from apps.store import points as points_service
+
+        self.ps = points_service
+        self.cust = models.Customer.objects.create(store=self.store, name="حمزة")
+        points_service.adjust(self.store, self.cust, 5, "هدية", key="t-void")
+
+    def bal(self):
+        return self.ps.balance_of(models.Customer.objects.for_pharmacy(self.store).get(pk=self.cust.pk))
+
+    def test_deleting_a_sale_takes_back_what_it_earned(self):
+        s = self.sell(10, customer=self.cust.pk)
+        self.assertGreater(self.bal(), 5)
+        r = self.api.delete(f"/api/v1/sales/{s.pk}/")
+        self.assertIn(r.status_code, (200, 204), r.content)
+        self.assertEqual(self.bal(), 5)
+
+    def test_deleting_a_sale_gives_back_what_it_spent(self):
+        self.ps.adjust(self.store, self.cust, 45, "رصيد", key="t-void-2")  # 50
+        s = self.sell(1, customer=self.cust.pk, beans_spent=50)
+        self.assertEqual(s.beans_spent, 50)
+        self.assertLess(self.bal(), 50)
+        self.api.delete(f"/api/v1/sales/{s.pk}/")
+        self.assertEqual(self.bal(), 50)
+
+    def test_the_total_box_cannot_ring_up_more_than_the_bill(self):
+        s = self.sell(1, customer=self.cust.pk, discounted_total="1200000")
+        self.assertEqual(s.discounted_total, s.total.to_integral_value(rounding="ROUND_CEILING"))
+        s2 = self.sell(1, discounted_total="5")
+        self.assertEqual(s2.discounted_total, D("5.00"))
+
+    def test_owner_can_remove_a_huge_mistaken_balance(self):
+        self.ps.adjust(self.store, self.cust, 99995, "خطأ", key="t-void-3")
+        self.ps.adjust(self.store, self.cust, 100000, "خطأ", key="t-void-4")  # 200,000
+        r = self.api.post(f"/api/v1/customers/{self.cust.pk}/points/", {"delta": -199995, "note": "تصحيح"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(self.bal(), 5)
+        r = self.api.post(f"/api/v1/customers/{self.cust.pk}/points/", {"delta": 100001}, format="json")
+        self.assertEqual(r.status_code, 400)

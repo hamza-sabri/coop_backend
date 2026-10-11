@@ -2686,8 +2686,11 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 return Response({"detail": "لا يوجد تغيير"}, status=400)
             # A cap, because this is a manual field on a till: a slipped digit
             # should be a rejected request, not a customer with 50,000 points.
-            if abs(delta) > 100000:
-                return Response({"detail": "الرقم كبير جداً"}, status=400)
+            # Taking points AWAY is never capped: it is clipped at the balance
+            # anyway, and the owner must be able to undo any mistake in one go
+            # (a test sale that minted 600,000 points could not be removed).
+            if delta > 100000:
+                return Response({"detail": "الرقم كبير جداً — أقصى إضافة 100,000 نقطة في المرة."}, status=400)
 
             note = (request.data.get("note") or "").strip()
             who = getattr(request.user, "username", "") or "staff"
@@ -3166,6 +3169,13 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                         ).update(stock=_F("stock") + delta * item.quantity)
             if locked.debt_id and not locked.debt.is_paid:
                 locked.debt.delete()
+            # The points this bill moved go back too: what it minted is taken
+            # back, what it redeemed is returned. Without this, a deleted bill
+            # left its points behind (a voided ₪1,200,000 test sale kept
+            # 600,000 points on the customer).
+            from apps.store import points as points_service
+
+            points_service.unwind_sale(locked)
             locked.delete()
 
     def _log_void(self, sale, *, bulk_count=None):

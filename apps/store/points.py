@@ -341,6 +341,33 @@ def reverse_award(store, customer, amount, *, source: str, source_id, cycle: int
     return points if applied else 0
 
 
+def unwind_sale(sale) -> int:
+    """Undo every point a sale moved, before the sale is deleted.
+
+    Net of the ledger rows tied to this sale (earned +, redeemed −, partial
+    returns −), posted as one opposite move. Taking back is clipped at the
+    balance by move(), like any reversal. Idempotent per sale. Returns the
+    signed delta applied.
+    """
+    from django.db.models import Sum
+
+    from apps.store.models import BeanLedger
+
+    if not sale.customer_id:
+        return 0
+    rows = BeanLedger.objects.unscoped().filter(store_id=sale.store_id, sale_id=sale.pk)
+    net = int(rows.aggregate(n=Sum("delta"))["n"] or 0)
+    if net == 0:
+        return 0
+    customer = rows.exclude(customer_id=None).first().customer
+    row, applied = move(
+        sale.store, customer, -net, BeanLedger.Reason.ADJUST,
+        f"إلغاء فاتورة #{sale.receipt_code or sale.pk}",
+        f"void:sale:{sale.pk}",
+    )
+    return int(row.delta) if (applied and row is not None) else 0
+
+
 def totals_for(store, customer) -> dict:
     """Everything earned and everything spent, from the ledger.
 
