@@ -257,6 +257,11 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+    # Every stored picture ("b2://…") leaves as a signed URL — see the renderer.
+    "DEFAULT_RENDERER_CLASSES": (
+        "apps.core.renderers.SignedMediaJSONRenderer",
+        "rest_framework.renderers.BrowsableAPIRenderer",
+    ),
     "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardPagination",
     "PAGE_SIZE": int(os.getenv("PAGE_SIZE", "30")),
     "DEFAULT_FILTER_BACKENDS": (

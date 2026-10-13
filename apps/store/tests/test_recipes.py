@@ -869,3 +869,17 @@ class ExtrapImportTests(RecipeBase):
     def test_owner_only(self):
         r = self.staff.post("/api/v1/import/extrap/", {}, format="multipart")
         self.assertEqual(r.status_code, 403)
+
+
+class SignedPicturesTests(RecipeBase):
+    def test_no_response_leaks_a_raw_b2_key(self):
+        self.latte.image = "b2://products/x.jpg"
+        self.latte.save(update_fields=["image"])
+        self.sell(1)
+        for url in ("/api/v1/reports/items/?period=month", f"/api/v1/reports/items/{self.latte.pk}/?period=month",
+                    "/api/v1/pos/catalog/", "/api/v1/products/"):
+            r = self.api.get(url)
+            if r.status_code == 404:
+                continue
+            self.assertEqual(r.status_code, 200, (url, r.content[:200]))
+            self.assertNotIn(b"b2://", r.content, url)
