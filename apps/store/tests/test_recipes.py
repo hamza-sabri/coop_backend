@@ -835,9 +835,14 @@ class ExtrapImportTests(RecipeBase):
         self.assertFalse(models.BeanLedger.objects.for_pharmacy(self.store).exists())
         self.assertEqual(self.stock(self.milk), milk_stock)  # inventory untouched by the import
         self.assertEqual(
-            sorted(models.Product.objects.for_pharmacy(self.store).values_list("name", flat=True)),
+            sorted(models.Product.objects.for_pharmacy(self.store).filter(is_active=True).values_list("name", flat=True)),
             ["اسبريسو دبل", "اضافة"],
         )
+        # The old menu is hidden, not deleted: its recipe is still there.
+        old = models.Product.objects.for_pharmacy(self.store).get(pk=self.latte.pk)
+        self.assertFalse(old.is_active)
+        self.assertTrue(old.name.endswith("(قديم)"))
+        self.assertTrue(models.RecipeLine.objects.for_pharmacy(self.store).filter(product=old).exists())
         s = models.Sale.objects.for_pharmacy(self.store).get(note__startswith="extrap:7652")
         self.assertEqual(s.discounted_total, D("16.00"))
         self.assertEqual(s.items.count(), 2)

@@ -61,12 +61,53 @@ WIPES: list[tuple[str, str, str]] = [
     ("حركات الصندوق", "CashMove", "store_id"),
     ("جلسات الصندوق", "CashSession", "store_id"),
     ("سجل التغييرات", "AuditLog", "store_id"),
-    # The menu. Recipes, sizes and pictures cascade with each product.
-    ("وصفات المشروبات", "RecipeLine", "store_id"),
-    ("أحجام المشروبات", "ProductVariant", "product__store_id"),
-    ("المشروبات", "Product", "store_id"),
-    ("التصنيفات", "Category", "store_id"),
 ]
+
+#: Appended to the old menu's drinks when they are hidden, so the menu page
+#: tells them apart from Extra P's drinks of the same name.
+OLD = " (قديم)"
+
+
+def _fold(s: str) -> str:
+    """Name key that ignores the spellings Arabic keyboards disagree on."""
+    import re
+
+    s = (s or "").strip()
+    s = re.sub(r"[\u064B-\u0652\u0640]", "", s)  # harakat, tatweel
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", " ", s)
+
+
+def hide_old_menu(store) -> dict:
+    """The menu that was here before Extra P: hidden from the till, never
+    deleted, so its recipes and sizes are still there to copy over.
+
+    Its categories are reused when Extra P has one of the same name (ة/ه,
+    أ/ا… ignored); any other old category is removed so the till does not show
+    empty circles — the hidden drinks remember it in their metadata."""
+    old = list(
+        models.Product.objects.for_pharmacy(store.pk)
+        .exclude(source_id__startswith=NOTE)
+        .select_related("category")
+    )
+    for p in old:
+        meta = dict(p.additional_metadata or {})
+        if p.category_id:
+            meta.setdefault("old_category", p.category.name)
+        p.additional_metadata = meta
+        p.is_active = False
+        if not p.name.endswith(OLD):
+            p.name = (p.name[: 255 - len(OLD)] + OLD)
+    models.Product.objects.bulk_update(old, ["additional_metadata", "is_active", "name"], batch_size=500)
+    return {"hidden": len(old)}
+
+
+def _drop_unused_old_categories(store, keep_ids) -> int:
+    gone = models.Category.objects.for_pharmacy(store.pk).exclude(pk__in=keep_ids)
+    models.Product.objects.for_pharmacy(store.pk).filter(category__in=gone, is_active=False).update(category=None)
+    n, _ = gone.delete()
+    return n
 
 
 def _model(name):
@@ -144,16 +185,23 @@ def load(store, dump: dict, *, request=None, do_wipe: bool = False, dry_run: boo
     with transaction.atomic():
         if do_wipe:
             report["wiped"] = wipe(store)
+            report["old_menu"] = hide_old_menu(store)
 
-        # ── categories ────────────────────────────────────────────────────
-        cats = {
-            c.name: c for c in models.Category.objects.for_pharmacy(store.pk)
-        }
+        # ── categories (an old one of the same name is reused) ───────────
+        existing = {_fold(c.name): c for c in models.Category.objects.for_pharmacy(store.pk)}
+        cats = {}
         for name in dump.get("categories", []):
             name = (name or "").strip()[:120]
-            if name and name not in cats:
-                cats[name] = models.Category.objects.create(store=store, name=name)
+            if not name:
+                continue
+            c = existing.get(_fold(name))
+            if c is None:
+                c = models.Category.objects.create(store=store, name=name)
+                existing[_fold(name)] = c
                 report["categories"] += 1
+            cats[name] = c
+        if do_wipe:
+            report["old_categories_removed"] = _drop_unused_old_categories(store, [c.pk for c in cats.values()])
 
         # ── products (matched by Extra P id) ─────────────────────────────
         by_src = {
