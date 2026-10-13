@@ -786,3 +786,81 @@ class VoidedSalePointsTests(RecipeBase):
         self.assertEqual(self.bal(), 5)
         r = self.api.post(f"/api/v1/customers/{self.cust.pk}/points/", {"delta": 100001}, format="json")
         self.assertEqual(r.status_code, 400)
+
+
+class ExtrapImportTests(RecipeBase):
+    """Moving a shop over from Extra P: menu rebuilt, sales loaded as history
+    (no stock, no points), money/points wiped, customers and inventory kept."""
+
+    def dump(self):
+        return {
+            "source": "extrap",
+            "categories": ["مشروبات ساخنه", "سويت"],
+            "products": [
+                {"id": 5, "name": "اسبريسو دبل", "code": "59709930", "category": "مشروبات ساخنه", "price": "7"},
+                {"id": 95, "name": "اضافة", "code": "00822197", "category": "سويت", "price": "2"},
+            ],
+            "sales": [
+                {"id": 7652, "ref": "posr-20261013-114959", "at": "2026-10-13T23:49:59", "payment": "cash",
+                 "total": "16", "grand_total": "16",
+                 "items": [{"code": "59709930", "name": "اسبريسو دبل", "qty": 2, "unit_price": "7"},
+                           {"code": "00822197", "name": "اضافة", "qty": 1, "unit_price": "2"}]},
+                {"id": 7651, "ref": "posr-20261013-112417", "at": "2026-10-13T11:24:17", "payment": "card",
+                 "total": "9", "grand_total": "9",
+                 "items": [{"code": "gone", "name": "صنف محذوف", "qty": 1, "unit_price": "9"}]},
+            ],
+        }
+
+    def post(self, dump, **flags):
+        import io
+        import json
+
+        f = io.BytesIO(json.dumps(dump).encode())
+        f.name = "x.json"
+        return self.api.post("/api/v1/import/extrap/", {"file": f, **flags}, format="multipart")
+
+    def test_wipes_money_and_menu_keeps_customers_and_inventory(self):
+        from apps.store import points as ps
+
+        cust = models.Customer.objects.create(store=self.store, name="زبون")
+        ps.adjust(self.store, cust, 50, "x", key="t-ex")
+        self.sell(1, customer=cust.pk)
+        milk_stock = self.stock(self.milk)
+        r = self.post(self.dump(), wipe="1")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json().get("data", r.json())
+        self.assertEqual(body["sales"], 2)
+        self.assertEqual(body["lines_unmatched"], 1)
+        self.assertTrue(models.Customer.objects.for_pharmacy(self.store).filter(pk=cust.pk).exists())
+        self.assertFalse(models.BeanLedger.objects.for_pharmacy(self.store).exists())
+        self.assertEqual(self.stock(self.milk), milk_stock)  # inventory untouched by the import
+        self.assertEqual(
+            sorted(models.Product.objects.for_pharmacy(self.store).values_list("name", flat=True)),
+            ["اسبريسو دبل", "اضافة"],
+        )
+        s = models.Sale.objects.for_pharmacy(self.store).get(note__startswith="extrap:7652")
+        self.assertEqual(s.discounted_total, D("16.00"))
+        self.assertEqual(s.items.count(), 2)
+        self.assertFalse(s.moves_stock())
+        from django.utils import timezone as tz
+
+        local = tz.localtime(s.created_at)
+        self.assertEqual((local.hour, local.minute), (23, 49))
+        card = models.Sale.objects.for_pharmacy(self.store).get(note__startswith="extrap:7651")
+        self.assertEqual(card.payment_method, "card")
+
+    def test_rerun_adds_only_new_and_dry_run_writes_nothing(self):
+        r = self.post(self.dump(), dry_run="1", wipe="1")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(models.Sale.objects.for_pharmacy(self.store).filter(note__startswith="extrap:").exists())
+        self.post(self.dump(), wipe="1")
+        d = self.dump()
+        d["sales"].append({"id": 7653, "at": "2026-10-14T09:00:00", "payment": "cash", "total": "7",
+                           "grand_total": "7", "items": [{"code": "59709930", "name": "اسبريسو دبل", "qty": 1, "unit_price": "7"}]})
+        body = self.post(d).json()
+        body = body.get("data", body)
+        self.assertEqual((body["sales"], body["sales_skipped"], body["products"]), (1, 2, 0))
+
+    def test_owner_only(self):
+        r = self.staff.post("/api/v1/import/extrap/", {}, format="multipart")
+        self.assertEqual(r.status_code, 403)
