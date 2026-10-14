@@ -347,6 +347,9 @@ if STORAGE_ENABLED:
     AWS_S3_FILE_OVERWRITE = False
     AWS_QUERYSTRING_AUTH = env_bool("B2_QUERYSTRING_AUTH", True)  # signed URLs (private bucket)
     AWS_QUERYSTRING_EXPIRE = int(os.getenv("B2_URL_EXPIRE", str(7 * 24 * 3600)))
+    # Every upload gets a fresh random name and is never edited in place, so
+    # browsers may keep a picture for good instead of downloading it again.
+    AWS_S3_OBJECT_PARAMETERS = {"CacheControl": "private, max-age=31536000, immutable"}
     STORAGES["default"] = {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
 
 # --- Redis cache (optional; local-memory fallback) --------------------------

@@ -40,7 +40,7 @@ class Base(TestCase):
         self.water = models.Product.objects.create(
             store=self.store, name="ماء", price=Decimal("3"), cost=Decimal("0"),
         )
-        self.cust = models.Customer.objects.create(store=self.store, name="سامر", phone="0599")
+        self.cust = models.Customer.objects.create(store=self.store, name="سامر", phone="0599000009")
 
     def sell(self, lines, client=None, **extra):
         body = {"items": [{"product": p.pk, "quantity": q} for p, q in lines], **extra}
@@ -356,7 +356,7 @@ class OwnerOnlyTests(Base):
 # ── offline: a customer made at the counter, then a sale for them ───────────
 class OfflineCustomerLinkTests(Base):
     def test_sale_finds_the_customer_by_its_client_id(self):
-        r = self.staff.post("/api/v1/customers/", {"name": "زبون جديد", "phone": "0591", "client_uuid": "c-1"}, format="json")
+        r = self.staff.post("/api/v1/customers/", {"name": "زبون جديد", "phone": "0591000001", "client_uuid": "c-1"}, format="json")
         self.assertEqual(r.status_code, 201, r.content)
         sale = self.sell([(self.latte, 1)], client=self.staff, customer_client_uuid="c-1")
         self.assertEqual(sale.customer.name, "زبون جديد")
@@ -369,14 +369,14 @@ class OfflineCustomerLinkTests(Base):
 
 class OfflineCustomerMergeTests(Base):
     def test_retry_of_the_same_create_is_not_a_duplicate(self):
-        body = {"name": "جديد", "phone": "0592", "client_uuid": "c-9"}
+        body = {"name": "جديد", "phone": "0592000002", "client_uuid": "c-9"}
         self.assertEqual(self.staff.post("/api/v1/customers/", body, format="json").status_code, 201)
         r = self.staff.post("/api/v1/customers/", body, format="json")
         self.assertIn(r.status_code, (200, 201), r.content)
-        self.assertEqual(models.Customer.objects.for_pharmacy(self.store).filter(phone="0592").count(), 1)
+        self.assertEqual(models.Customer.objects.for_pharmacy(self.store).filter(phone="0592000002").count(), 1)
 
     def test_offline_customer_with_a_known_phone_adopts_the_existing_one(self):
-        r = self.staff.post("/api/v1/customers/", {"name": "سامر م", "phone": "0599", "client_uuid": "c-7",
+        r = self.staff.post("/api/v1/customers/", {"name": "سامر م", "phone": "0599000009", "client_uuid": "c-7",
                                                    "merge_on_phone": True}, format="json")
         self.assertIn(r.status_code, (200, 201), r.content)
         self.assertEqual(r.json()["id"], self.cust.pk)
@@ -384,7 +384,7 @@ class OfflineCustomerMergeTests(Base):
         self.assertEqual(sale.customer_id, self.cust.pk)
 
     def test_online_duplicate_phone_is_still_refused(self):
-        r = self.staff.post("/api/v1/customers/", {"name": "x", "phone": "0599"}, format="json")
+        r = self.staff.post("/api/v1/customers/", {"name": "x", "phone": "0599000009"}, format="json")
         self.assertEqual(r.status_code, 400)
 
 

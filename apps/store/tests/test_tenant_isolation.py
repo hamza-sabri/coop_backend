@@ -35,7 +35,7 @@ class TenantFixtureMixin:
         cls.med_b = models.Product.objects.create(
             store=cls.ph_b, name="Med B", barcode="555", price=Decimal("99.00"), stock=5
         )
-        cls.cust_a = models.Customer.objects.create(store=cls.ph_a, name="Ahmad", phone="0561")
+        cls.cust_a = models.Customer.objects.create(store=cls.ph_a, name="Ahmad", phone="0561000001")
         cls.cust_b = models.Customer.objects.create(store=cls.ph_b, name="Basel", phone="0562")
 
     def setUp(self):
@@ -177,9 +177,9 @@ class WriteScopingTests(TenantFixtureMixin, TestCase):
         self.assertEqual(debt.store_id, self.ph_a.pk)
 
     def test_phone_unique_per_pharmacy_only(self):
-        r = self.B.post("/api/v1/customers/", {"name": "Same number", "phone": "0561"}, format="json")
+        r = self.B.post("/api/v1/customers/", {"name": "Same number", "phone": "0561000001"}, format="json")
         self.assertEqual(r.status_code, 201)  # A already has 0561 — B may too
-        r = self.A.post("/api/v1/customers/", {"name": "Dup", "phone": "0561"}, format="json")
+        r = self.A.post("/api/v1/customers/", {"name": "Dup", "phone": "0561000001"}, format="json")
         self.assertEqual(r.status_code, 400)
 
     def test_taxonomy_same_name_two_rows(self):

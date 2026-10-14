@@ -599,7 +599,18 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
 
     def validate_phone(self, value):
         # Empty phone -> NULL, so many customers may have no phone at all.
-        return (value or "").strip() or None
+        # Otherwise ONE format — the local "0599123456" — whatever was typed
+        # ("+970 599 123 456", "599-123-456"): the customer will sign in to the
+        # app with this number (OTP), and that is how the two get linked.
+        from apps.store.club import PHONE_RE, normalise_phone
+
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        phone = normalise_phone(raw)
+        if not PHONE_RE.match(phone):
+            raise serializers.ValidationError("رقم جوال غير صحيح — مثال: 0599123456")
+        return phone
 
     def _offline_replay(self):
         """A customer added at the counter while offline, now syncing.

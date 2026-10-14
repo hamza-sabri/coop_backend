@@ -244,7 +244,12 @@ def upsert_customer_from_firebase(store, claims: dict, extra: dict | None = None
         or "زبون كوب"
     )
     avatar = claims.get("picture") or ""
-    phone = (claims.get("phone_number") or extra.get("phone") or "").strip() or None
+    # Phone sign-in (the app's OTP) reports "+970599…"; the till stores the
+    # local "0599…". One format, or the person the staff registered by phone is
+    # never found and gets a second, empty account.
+    from apps.store.club import normalise_phone
+
+    phone = normalise_phone(claims.get("phone_number") or extra.get("phone") or "") or None
 
     with transaction.atomic():
         scoped = Customer.objects.for_pharmacy(store.pk)

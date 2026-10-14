@@ -39,15 +39,42 @@ def store_upload(file, folder: str = "uploads", request=None) -> str:
     return url
 
 
+#: How long one signed link is handed out before a new one is made. Well
+#: inside the link's own lifetime (B2_URL_EXPIRE, 7 days), so a link given out
+#: at the end of the window still works for days.
+SIGNED_URL_REUSE = 24 * 3600
+
+
 def resolve_stored_url(value) -> str:
     """Turn a stored value into a servable URL.
 
-    ``b2://<key>`` → freshly signed B2 URL (valid B2_URL_EXPIRE seconds);
+    ``b2://<key>`` → a signed B2 URL (valid B2_URL_EXPIRE seconds);
     anything else (external URLs, local /media paths) passes through.
+
+    The SAME signed link is reused for a day. Signing afresh on every response
+    gave every picture a new address each time the app refreshed its data, so
+    the browser could never use its saved copy and downloaded every picture
+    again and again — enough to exhaust Backblaze's daily download cap and
+    break every picture in the shop until the next day.
     """
     if isinstance(value, str) and value.startswith(B2_SCHEME):
+        key = value[len(B2_SCHEME):]
+        from django.core.cache import cache
+
+        ck = f"b2url:{key}"
         try:
-            return default_storage.url(value[len(B2_SCHEME):])
+            url = cache.get(ck)
+        except Exception:
+            url = None
+        if url:
+            return url
+        try:
+            url = default_storage.url(key)
         except Exception:
             return ""
+        try:
+            cache.set(ck, url, SIGNED_URL_REUSE)
+        except Exception:
+            pass
+        return url
     return value or ""

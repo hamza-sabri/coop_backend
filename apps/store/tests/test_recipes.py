@@ -353,9 +353,13 @@ class StoredAvatarTests(RecipeBase):
     def test_pos_list_and_sales_serve_a_link_not_the_storage_key(self):
         from unittest import mock
 
+        from django.core.cache import cache
+
+        cache.clear()  # signed links are reused for a day — start clean
         c = models.Customer.objects.create(store=self.store, name="ليان", phone="0590000009", avatar="b2://avatars/x.jpg")
         self.sell(1, customer=c.pk)
         with mock.patch("apps.core.uploads.default_storage.url", return_value="https://signed.example/x.jpg"):
+            cache.clear()  # the sale above already signed (and kept) a link
             q = self.api.get("/api/v1/customers/quick/").json()
             q = q.get("data", q)
             row = next(r for r in q["results"] if r["id"] == c.pk)
@@ -1129,3 +1133,39 @@ class SaleTimeWindowTests(RecipeBase):
         self.assertEqual(ids, [b.pk])
         ids = [r["id"] for r in self.api.get("/api/v1/sales/", {"at_to": cut}).json()["results"]]
         self.assertEqual(ids, [a.pk])
+
+
+class PhoneSignupTests(RecipeBase):
+    """Staff register customers by name + phone; the app later signs them in
+    by phone (OTP) and must land on that same customer and their points."""
+
+    def test_staff_phone_is_stored_in_one_format(self):
+        r = self.staff.post("/api/v1/customers/", {"name": "لين", "phone": "+970 599-123-456"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["phone"], "0599123456")
+        r = self.staff.post("/api/v1/customers/", {"name": "x", "phone": "0599 123 456"}, format="json")
+        self.assertEqual(r.status_code, 400)  # same number, same person
+        self.assertEqual(self.staff.post("/api/v1/customers/", {"name": "y", "phone": "12"}, format="json").status_code, 400)
+
+    def test_app_phone_sign_in_finds_the_customer_the_staff_registered(self):
+        from apps.accounts.firebase import upsert_customer_from_firebase
+
+        r = self.staff.post("/api/v1/customers/", {"name": "لين", "phone": "0599123456"}, format="json")
+        cid = r.json()["id"]
+        cust = upsert_customer_from_firebase(self.store, {"sub": "otp-1", "phone_number": "+970599123456"})
+        self.assertEqual(cust.pk, cid)
+        self.assertEqual(cust.firebase_uid, "otp-1")
+
+
+class StableSignedLinksTests(RecipeBase):
+    def test_the_same_picture_gets_the_same_link(self):
+        from unittest import mock
+        from django.core.cache import cache
+        from apps.core import uploads
+
+        cache.clear()
+        calls = iter(["https://b2/x.jpg?sig=1", "https://b2/x.jpg?sig=2"])
+        with mock.patch.object(uploads.default_storage, "url", side_effect=lambda k: next(calls)):
+            a = uploads.resolve_stored_url("b2://products/x.jpg")
+            b = uploads.resolve_stored_url("b2://products/x.jpg")
+        self.assertEqual(a, b)  # one signature for the day → the browser's copy is reused
