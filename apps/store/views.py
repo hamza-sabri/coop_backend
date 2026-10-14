@@ -4493,9 +4493,13 @@ class ShopMeView(APIView):
             .values("delta", "reason", "note", "balance_after", "created_at")
         )
 
+        from apps.store import club
+
         return Response({
             "synced": True,
             "name": customer.name,
+            "profile": club.profile(customer),
+            "purchases": club.purchases(store, customer),
             "beans": beans,
             "tier": getattr(profile, "tier", "single"),
             "multiplier": str(getattr(profile, "multiplier", 1)),
@@ -4523,6 +4527,27 @@ class ShopMeView(APIView):
             ],
         })
 
+    def patch(self, request):
+        """Save the customer's own profile: name, gender, phone, birthday."""
+        from apps.store import club
+
+        ident = identity_filter(request)
+        if not ident:
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
+        store = models.Store.objects.filter(
+            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+        ).first()
+        if store is None:
+            return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
+        customer = models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        if customer is None:
+            return Response({"detail": "سجّل دخولك من جديد."}, status=409)
+        try:
+            customer = club.update_profile(store, customer, request.data or {})
+        except club.ProfileError as e:
+            return Response({"detail": e.msg, "field": e.field}, status=e.status)
+        invalidate_customers_quick_cache(store.pk)
+        return Response({"profile": club.profile(customer)})
 
 
 class ShopOrdersView(APIView):

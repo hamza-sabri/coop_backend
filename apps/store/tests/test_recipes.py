@@ -883,3 +883,72 @@ class SignedPicturesTests(RecipeBase):
                 continue
             self.assertEqual(r.status_code, 200, (url, r.content[:200]))
             self.assertNotIn(b"b2://", r.content, url)
+
+
+class CustomerWebProfileTests(RecipeBase):
+    """The web door: a customer signed in with Google sees and edits their own
+    profile, points and visits — and a number the till already knows joins the
+    two into one customer."""
+
+    def setUp(self):
+        super().setUp()
+        from django.test import override_settings
+
+        self._ov = override_settings(CLERK_STORE_SLUG=self.store.slug, FIREBASE_PROJECT_ID="p")
+        self._ov.enable()
+        self.me = models.Customer.objects.create(
+            store=self.store, name="سما", firebase_uid="u1", email="s@x.com")
+        self.p1 = mock.patch("apps.accounts.firebase.looks_like_firebase", return_value=True)
+        self.p2 = mock.patch("apps.accounts.firebase.verify_id_token", return_value={"sub": "u1"})
+        self.p1.start(); self.p2.start()
+        self.web = APIClient()
+        self.web.credentials(HTTP_AUTHORIZATION="Bearer t")
+
+    def tearDown(self):
+        self.p1.stop(); self.p2.stop(); self._ov.disable()
+        super().tearDown()
+
+    def test_profile_and_visits(self):
+        self.sell(2, customer=self.me.pk)
+        r = self.web.get("/api/v1/shop/me/")
+        self.assertEqual(r.status_code, 200, r.content)
+        b = r.json()
+        self.assertEqual(b["profile"]["gender"], "")  # never asked yet
+        self.assertFalse(b["profile"]["complete"])
+        self.assertEqual(len(b["purchases"]), 1)
+        self.assertEqual(b["purchases"][0]["items"][0]["qty"], "2")
+        self.assertGreater(b["purchases"][0]["points_earned"], 0)
+
+    def test_saves_gender_phone_birthday(self):
+        r = self.web.patch("/api/v1/shop/me/", {"gender": "female", "phone": "+970 59-702-0201",
+                                                 "birth_date": "1998-04-02"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        p = r.json()["profile"]
+        self.assertEqual((p["gender"], p["phone"], p["birth_date"], p["complete"]),
+                         ("female", "0597020201", "1998-04-02", True))
+        self.assertEqual(self.web.patch("/api/v1/shop/me/", {"phone": "12"}, format="json").status_code, 400)
+        self.assertEqual(self.web.patch("/api/v1/shop/me/", {"gender": "x"}, format="json").status_code, 400)
+
+    def test_a_till_customer_with_that_number_becomes_the_same_account(self):
+        from apps.store import points as ps
+
+        regular = models.Customer.objects.create(store=self.store, name="سما (كاشير)", phone="0599111222")
+        self.sell(1, customer=regular.pk)
+        ps.adjust(self.store, self.me, 5, "هدية", key="t-gift")
+        before = ps.balance_of(models.Customer.objects.for_pharmacy(self.store).get(pk=regular.pk))
+        r = self.web.patch("/api/v1/shop/me/", {"phone": "0599111222"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(models.Customer.objects.for_pharmacy(self.store).filter(pk=self.me.pk).exists())
+        merged = models.Customer.objects.for_pharmacy(self.store).get(pk=regular.pk)
+        self.assertEqual(merged.firebase_uid, "u1")
+        self.assertEqual(ps.balance_of(merged), before + 5)
+        b = self.web.get("/api/v1/shop/me/").json()
+        self.assertEqual(len(b["purchases"]), 1)
+
+    def test_a_number_owned_by_another_app_account_is_refused(self):
+        models.Customer.objects.create(store=self.store, name="آخر", phone="0599000000", firebase_uid="u2")
+        r = self.web.patch("/api/v1/shop/me/", {"phone": "0599000000"}, format="json")
+        self.assertEqual(r.status_code, 409)
+
+    def test_signed_out_is_refused(self):
+        self.assertIn(APIClient().get("/api/v1/shop/me/").status_code, (401, 403))

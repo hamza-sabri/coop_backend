@@ -521,6 +521,12 @@ class Customer(TimeStampedModel):
         max_length=10, choices=GENDER_CHOICES, default="male", db_index=True
     )
     avatar = models.URLField(max_length=1000, blank=True)
+    #: True once the CUSTOMER chose their gender in the app. `gender` itself
+    #: defaults to "male" for rows the staff add, so without this the app
+    #: could never tell "chose male" from "never asked".
+    gender_set = models.BooleanField(default=False)
+    #: Optional — for a birthday treat. Day and month are what matter.
+    birth_date = models.DateField(null=True, blank=True)
     # Set when the customer signs into the ordering app. Blank for anyone the
     # staff added at the counter — the two populations share one table because
     # they are one person: the regular who later installs the app must keep
