@@ -25,6 +25,7 @@ import django_filters
 from apps.core.search import ArabicSearchFilter, text_q
 from apps.core.permissions import (
     ModuleEnabled,
+    CanEditPrices,
     OwnerRequired,
     StoreRequired,
     StoreResolved,
@@ -51,6 +52,9 @@ class SaleFilter(django_filters.FilterSet):
     #: on the P&L and the period chips — so a chip's count and its list agree.
     day_from = django_filters.DateFilter(method="filter_day_from")
     day_to = django_filters.DateFilter(method="filter_day_to")
+    #: An exact moment range — date, hour and minute (the sales page's time filter).
+    at_from = django_filters.IsoDateTimeFilter(field_name="created_at", lookup_expr="gte")
+    at_to = django_filters.IsoDateTimeFilter(field_name="created_at", lookup_expr="lte")
 
     def filter_day_from(self, queryset, name, value):
         from apps.store import finance
@@ -128,6 +132,8 @@ class SaleFilter(django_filters.FilterSet):
             "created_before",
             "day_from",
             "day_to",
+            "at_from",
+            "at_to",
             "min_price",
             "max_price",
             "item",
@@ -568,6 +574,9 @@ class MedicationViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         # Bulk delete/edit rewrite catalogue data — owners only, never employees.
         if getattr(self, "action", None) in ("bulk_delete", "bulk_update", "export_hesabate"):
             perms.append(OwnerRequired())
+        # Deleting a drink takes its prices with it — needs the price permission.
+        if getattr(self, "action", None) == "destroy":
+            perms.append(CanEditPrices())
         return perms
 
     @action(detail=False, methods=["post"])
@@ -1043,6 +1052,13 @@ class MedicationVariantViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
     ordering_fields = ["label", "price", "stock", "created_at"]
     ordering = ["label"]
+
+    def get_permissions(self):
+        perms = super().get_permissions()
+        # A size IS a price: removing one needs the price permission.
+        if getattr(self, "action", None) == "destroy":
+            perms.append(CanEditPrices())
+        return perms
 
     def get_queryset(self):
         return (
@@ -3147,13 +3163,15 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 .first()
             )
             if locked is None:
-                return  # someone else voided it while we waited for the lock
+                return 0  # someone else voided it while we waited for the lock
 
             # Ingredients back on the shelf, as a reversing move: the history
-            # keeps both the sale's use and its cancellation.
+            # keeps both the sale's use and its cancellation. Returns how many
+            # ingredient moves were reversed — 0 for a return (it never took
+            # any), an imported sale, or drinks with no recipe.
             from apps.store import recipes
 
-            recipes.reverse_sale(locked, reason="إلغاء فاتورة", user=self.request.user)
+            restocked = recipes.reverse_sale(locked, reason="إلغاء فاتورة", user=self.request.user)
 
             if self._restores_stock(locked) and tracks_menu_stock():
                 # sale → put stock back, return → take it out again
@@ -3177,6 +3195,7 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
             points_service.unwind_sale(locked)
             locked.delete()
+        return restocked
 
     def _log_void(self, sale, *, bulk_count=None):
         """Leave a trace. Deleting a sale erases the only other record of it."""
@@ -3222,8 +3241,16 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         # Log BEFORE the delete — afterwards the row and its items are gone.
         self._log_void(instance)
-        self._void_sale(instance)
+        self._restocked = self._void_sale(instance)
         self._invalidate()
+
+    def destroy(self, request, *args, **kwargs):
+        # Tell the till what actually happened, so its message is true:
+        # how many ingredient lines went back on the shelf (often none).
+        instance = self.get_object()
+        was_return = bool(instance.is_return)
+        self.perform_destroy(instance)
+        return Response({"restocked": int(getattr(self, "_restocked", 0) or 0), "was_return": was_return})
 
     def perform_update(self, serializer):
         """Edit a sale in place, and leave a trail that says so.

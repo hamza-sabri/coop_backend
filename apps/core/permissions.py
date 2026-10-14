@@ -136,3 +136,15 @@ class IsSelfOrAdmin(BasePermission):
         if request.user and request.user.is_staff:
             return True
         return obj == request.user
+
+
+class CanEditPrices(BasePermission):
+    """Owners, and employees the owner allowed to change prices (staff page)."""
+
+    message = "ليس لديك صلاحية تعديل الأسعار — يمنحها المالك من صفحة الموظفين."
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and (
+            getattr(user, "is_superuser", False) or getattr(user, "may_edit_prices", False)
+        ))

@@ -105,6 +105,15 @@ def _viewer_is_owner(serializer) -> bool:
     return bool(user.is_superuser or getattr(user, "role", "") == "owner")
 
 
+def _viewer_can_price(serializer) -> bool:
+    """Owner, or an employee allowed to change prices (staff page toggle)."""
+    request = (getattr(serializer, "context", None) or {}).get("request")
+    if request is None:
+        return True
+    user = getattr(request, "user", None)
+    return bool(user and getattr(user, "is_authenticated", False) and getattr(user, "may_edit_prices", False))
+
+
 class OwnerOnlyFieldsMixin:
     """Fields only an owner reads or writes — cost, and what follows from it.
 
@@ -114,6 +123,26 @@ class OwnerOnlyFieldsMixin:
     """
 
     owner_only_fields: tuple = ()
+    #: Readable by everyone, WRITABLE only by the owner — a price. An employee
+    #: who sends one (or tries to create the item, which sets one) is refused
+    #: outright rather than silently ignored, so the screen can say why.
+    owner_write_fields: tuple = ()
+
+    def _guard_owner_writes(self, attrs):
+        if self.owner_write_fields and not _viewer_can_price(self):
+            from rest_framework.exceptions import PermissionDenied
+
+            inst = getattr(self, "instance", None)
+            if inst is None:
+                raise PermissionDenied("إضافة صنف جديد أو تحديد سعره يحتاج صلاحية تعديل الأسعار.")
+            for f in self.owner_write_fields:
+                if f in attrs and Decimal(str(attrs[f] or 0)) != Decimal(str(getattr(inst, f) or 0)):
+                    raise PermissionDenied("ليس لديك صلاحية تعديل الأسعار — يمنحها المالك من صفحة الموظفين.")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        self._guard_owner_writes(attrs)
+        return attrs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -142,6 +171,7 @@ class ProductVariantSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer
     )
     is_pack = serializers.BooleanField(read_only=True)
     owner_only_fields = ("cost",)
+    owner_write_fields = ("price",)
 
     class Meta:
         model = models.ProductVariant
@@ -185,6 +215,7 @@ class ProductVariantSerializer(OwnerOnlyFieldsMixin, serializers.ModelSerializer
         the box price was derived at import too — the difference is that it is
         now a default rather than the only possibility.
         """
+        self._guard_owner_writes(attrs)
         pack = attrs.get("pack_size", getattr(self.instance, "pack_size", None))
         price = attrs.get("price", getattr(self.instance, "price", None))
         product = attrs.get("product", getattr(self.instance, "product", None))
@@ -207,6 +238,7 @@ class ProductSerializer(OwnerOnlyFieldsMixin, ImageUploadMixin, serializers.Mode
 
     MAX_GALLERY = 8
     owner_only_fields = ("cost",)
+    owner_write_fields = ("price",)
 
     # Declared lax (required=False) so PATCH may omit it; validate() still
     # rejects a CREATE without a name — nothing is ever prefilled from other
@@ -276,6 +308,7 @@ class ProductSerializer(OwnerOnlyFieldsMixin, ImageUploadMixin, serializers.Mode
         return ""
 
     def validate(self, attrs):
+        self._guard_owner_writes(attrs)
         # A create must carry its own name. (The old shared-catalog prefill
         # leaked another store's product name across tenants.)
         name = " ".join(str(attrs.get("name") or "").split())
@@ -1078,19 +1111,29 @@ class SaleSerializer(serializers.ModelSerializer):
             )
         return attrs
 
-    def _snapshot_items(self, items_data):
+    def _snapshot_items(self, items_data, kept_prices=None):
+        # Prices are the owner's. An employee rings the menu price — whatever
+        # the till sent — and on an edit keeps the price the line already had.
+        staff = not _viewer_can_price(self)
+        kept_prices = kept_prices or {}
         rows = []
         for item in items_data:
             med = item.get("product")
             variant = item.get("variant")
             name = item.get("medication_name") or (med.name if med else "")
             unit_price = item.get("unit_price")
-            if unit_price is None:
-                unit_price = (
-                    variant.price
-                    if variant
-                    else (med.price if med else Decimal("0.00"))
+            catalogue = (
+                variant.price
+                if variant
+                else (med.price if med else None)
+            )
+            if staff and catalogue is not None:
+                unit_price = kept_prices.get(
+                    (getattr(med, "pk", None), getattr(variant, "pk", None)), catalogue
                 )
+                item = {**item, "original_unit_price": None}
+            if unit_price is None:
+                unit_price = catalogue if catalogue is not None else Decimal("0.00")
             rows.append(
                 {
                     "product": med,
@@ -1172,6 +1215,8 @@ class SaleSerializer(serializers.ModelSerializer):
 
         items_data = validated_data.pop("items")
         discounted = validated_data.pop("discounted_total", _UNSET)
+        if not _viewer_can_price(self):
+            discounted = _UNSET  # menu prices only; discounts need the price permission
         validated_data["receipt_code"] = self._receipt_code(
             store_id, validated_data.get("receipt_code")
         )
@@ -1430,6 +1475,16 @@ class SaleSerializer(serializers.ModelSerializer):
 
         items_data = validated_data.pop("items")
         discounted = validated_data.pop("discounted_total", _UNSET)
+        staff = not _viewer_can_price(self)
+        if staff:
+            # An employee correcting a sale may change WHAT was sold, never
+            # what it cost: the total keeps its old discount, and each line
+            # keeps the price it was rung at.
+            discounted = _UNSET
+        kept_prices = {
+            (i.product_id, i.variant_id): i.unit_price for i in instance.items.all()
+        } if staff else None
+        old_discount = (instance.total or 0) - (instance.discounted_total or 0)
         store_id = instance.store_id
         editor = None
         request = self.context.get("request")
@@ -1470,7 +1525,7 @@ class SaleSerializer(serializers.ModelSerializer):
             #    quantity went 3 → 4 costs one unit, not a give-back-3-take-4
             #    round trip that briefly invents stock and loses the difference
             #    if anything fails between the two.
-            rows = self._snapshot_items(items_data)
+            rows = self._snapshot_items(items_data, kept_prices)
             is_return = validated_data.get("is_return", sale.is_return)
             if sale.moves_stock() and tracks_menu_stock():
                 old_p, old_v = self._existing_deltas(sale)
@@ -1501,7 +1556,10 @@ class SaleSerializer(serializers.ModelSerializer):
             sale.total = sum(
                 (i.line_total for i in created), Decimal("0.00")
             ).quantize(Decimal("0.01"))
-            sale.discounted_total = _billed(sale.total, discounted)
+            sale.discounted_total = (
+                max(Decimal("0.00"), sale.total - old_discount).quantize(Decimal("0.01"))
+                if staff else _billed(sale.total, discounted)
+            )
 
             # 4. The customer's balance has to follow the sale.
             self._rebuild_debt(sale, rows, sale.created_by)

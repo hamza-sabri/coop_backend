@@ -338,6 +338,9 @@ class OwnerOnlyTests(Base):
         self.assertIn("cost", self.api.get(f"/api/v1/products/{self.latte.pk}/").json())
 
     def test_employee_saving_a_drink_cannot_change_its_cost(self):
+        # An employee the owner allowed to change prices.
+        self.emp.can_edit_prices = True
+        self.emp.save(update_fields=["can_edit_prices"])
         r = self.staff.patch(f"/api/v1/products/{self.latte.pk}/", {"cost": "0", "price": "13"}, format="json")
         self.assertEqual(r.status_code, 200, r.content)
         self.latte.refresh_from_db()

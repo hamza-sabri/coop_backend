@@ -60,6 +60,10 @@ class User(AbstractUser):
     # EMPTY LIST = everything the store has. Lets an owner give a cashier
     # POS-only access, a bookkeeper debts-only, etc.
     allowed_modules = models.JSONField(default=list, blank=True)
+    #: May this employee change prices — drink and size prices on the menu,
+    #: line prices and the total (discounts) at the till? Off by default; the
+    #: owner turns it on per employee on the staff page. Owners always can.
+    can_edit_prices = models.BooleanField(default=False)
     phone = models.CharField(max_length=20, blank=True, db_index=True)
     display_name = models.CharField(max_length=150, blank=True)
     # Uploaded profile image (stored on B2 when configured, else locally).
@@ -96,6 +100,10 @@ class User(AbstractUser):
         if self.is_superuser:
             return "الإدارة"
         return self.get_username().split("@", 1)[0]
+
+    @property
+    def may_edit_prices(self) -> bool:
+        return self.is_owner or bool(self.can_edit_prices)
 
     @property
     def is_owner(self) -> bool:

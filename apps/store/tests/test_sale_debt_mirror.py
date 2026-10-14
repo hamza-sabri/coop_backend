@@ -153,7 +153,7 @@ class DeleteSaleLinkedDebtTests(TestCase):
 
         res = self.client.delete(f"/api/v1/sales/{sale.pk}/")
 
-        self.assertEqual(res.status_code, 204)
+        self.assertEqual(res.status_code, 200)
         self.assertFalse(
             models.Sale.objects.unscoped().filter(pk=sale.pk).exists()
         )

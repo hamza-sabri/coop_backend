@@ -110,11 +110,19 @@ class ConsumptionTests(RecipeBase):
 
     def test_voiding_puts_it_back_and_keeps_the_history(self):
         sale = self.sell(3)
-        self.assertEqual(self.api.delete(f"/api/v1/sales/{sale.pk}/").status_code, 204)
+        r = self.api.delete(f"/api/v1/sales/{sale.pk}/")
+        self.assertEqual(r.status_code, 200)
+        self.assertGreater(r.json()["restocked"], 0)  # the till says so only when true
         self.assertEqual(self.stock(self.milk), D("10000"))
         self.assertEqual(self.stock(self.cup), D("500"))
         # 3 taken + 3 put back, all kept
         self.assertEqual(models.StockMove.objects.for_pharmacy(self.store).filter(kind="sale").count(), 6)
+
+    def test_voiding_a_return_says_nothing_went_back(self):
+        sale = self.sell(1, is_return=True)
+        r = self.api.delete(f"/api/v1/sales/{sale.pk}/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"restocked": 0, "was_return": True})
 
     def test_an_edit_takes_only_the_difference_in_effect(self):
         sale = self.sell(2)
@@ -1028,3 +1036,94 @@ class SyncExtrapTests(RecipeBase):
     def test_dry_run_changes_nothing(self):
         self.run_sync(self.fake_rows(), dry_run=True)
         self.assertEqual(self.notes(), [])
+
+
+class PricesAreTheOwnersTests(RecipeBase):
+    """An employee sells at the menu price and cannot change a price — not on
+    the menu, not at the till, not by editing a sale afterwards."""
+
+    def test_staff_cannot_change_menu_prices(self):
+        r = self.staff.patch(f"/api/v1/products/{self.latte.pk}/", {"price": "1.00"}, format="json")
+        self.assertEqual(r.status_code, 403)
+        r = self.staff.patch(f"/api/v1/products/{self.latte.pk}/", {"name": "لاتيه كبير"}, format="json")
+        self.assertIn(r.status_code, (200, 403))  # other fields follow the menu module rules
+        self.assertEqual(self.staff.post("/api/v1/products/", {"name": "جديد", "price": "5"}, format="json").status_code, 403)
+        self.assertEqual(self.staff.delete(f"/api/v1/products/{self.latte.pk}/").status_code, 403)
+        r = self.api.patch(f"/api/v1/products/{self.latte.pk}/", {"price": "13.00"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+
+    def test_staff_cannot_change_a_size_price(self):
+        r = self.staff.patch(f"/api/v1/variants/{self.large.pk}/", {"price": "1.00"}, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.staff.delete(f"/api/v1/variants/{self.large.pk}/").status_code, 403)
+
+    def test_staff_sell_at_the_menu_price_with_no_discount(self):
+        price = models.Product.objects.for_pharmacy(self.store).get(pk=self.latte.pk).price
+        r = self.staff.post("/api/v1/sales/", {
+            "items": [{"product": self.latte.pk, "quantity": 2, "unit_price": "1.00", "original_unit_price": str(price)}],
+            "discounted_total": "1.00",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        s = models.Sale.objects.for_pharmacy(self.store).get(pk=r.json()["id"])
+        self.assertEqual(s.items.get().unit_price, price)
+        self.assertEqual(s.discounted_total, price * 2)
+        # The owner still can.
+        s2 = self.sell(1, discounted_total="5.00")
+        self.assertEqual(s2.discounted_total, D("5.00"))
+
+    def test_staff_editing_a_sale_keeps_its_prices(self):
+        s = self.sell(1, discounted_total="10.00")  # owner gave a discount
+        price = s.items.get().unit_price
+        r = self.staff.patch(f"/api/v1/sales/{s.pk}/", {
+            "items": [{"product": self.latte.pk, "quantity": 2, "unit_price": "0.50"}],
+            "discounted_total": "0.00",
+        }, format="json")
+        self.assertIn(r.status_code, (200, 403), r.content)
+        if r.status_code == 200:
+            s.refresh_from_db()
+            self.assertEqual(s.items.get().unit_price, price)
+            self.assertEqual(s.discounted_total, price * 2 - (price - D("10.00")))
+
+    def test_owner_can_allow_an_employee_to_change_prices(self):
+        # Off by default; the owner turns it on from the staff page.
+        self.assertFalse(self.staff.get("/api/v1/auth/me/").json().get("can_edit_prices"))
+        r = self.api.patch(f"/api/v1/staff/{self.emp.pk}/", {"can_edit_prices": True}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.json()["can_edit_prices"])
+        self.emp.refresh_from_db()
+        self.staff.force_authenticate(self.emp)  # a real request reloads the user
+        self.assertTrue(self.staff.get("/api/v1/auth/me/").json()["can_edit_prices"])
+        r = self.staff.patch(f"/api/v1/products/{self.latte.pk}/", {"price": "14.00"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        s = self.sell(1, client=self.staff, discounted_total="5.00")
+        self.assertEqual(s.discounted_total, Decimal("5.00"))
+        # An employee cannot grant it to themselves.
+        self.emp.can_edit_prices = False
+        self.emp.save(update_fields=["can_edit_prices"])
+        r = self.staff.patch(f"/api/v1/staff/{self.emp.pk}/", {"can_edit_prices": True}, format="json")
+        self.assertIn(r.status_code, (403, 404))
+
+
+class CategoryIconTests(RecipeBase):
+    def test_new_categories_get_a_fitting_icon_and_the_owner_can_change_it(self):
+        r = self.api.post("/api/v1/categories/", {"name": "موهيتو"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["icon"], "martini")
+        r = self.api.patch(f"/api/v1/categories/{r.json()['id']}/", {"icon": "citrus"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["icon"], "citrus")
+
+
+class SaleTimeWindowTests(RecipeBase):
+    def test_sales_filter_to_the_minute(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        a = self.sell(1)
+        b = self.sell(1)
+        models.Sale.unguarded.filter(pk=a.pk).update(created_at=timezone.now() - timedelta(hours=2))
+        cut = (timezone.now() - timedelta(minutes=30)).isoformat()
+        ids = [r["id"] for r in self.api.get("/api/v1/sales/", {"at_from": cut}).json()["results"]]
+        self.assertEqual(ids, [b.pk])
+        ids = [r["id"] for r in self.api.get("/api/v1/sales/", {"at_to": cut}).json()["results"]]
+        self.assertEqual(ids, [a.pk])

@@ -180,6 +180,15 @@ class Category(TimeStampedModel):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        # Every category gets an icon on the till from day one; the owner
+        # changes it from the menu page if the guess is wrong.
+        if not self.icon:
+            from apps.store.category_icons import guess
+
+            self.icon = guess(self.name)
+        super().save(*args, **kwargs)
+
 
 class Manufacturer(TimeStampedModel):
     """A producing company (الشركة المنتجة) — one row per name & store."""
