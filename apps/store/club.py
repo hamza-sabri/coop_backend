@@ -51,7 +51,7 @@ def purchases(store, c: models.Customer, limit: int = 30) -> list[dict]:
         models.Sale.objects.for_pharmacy(store.pk)
         .filter(customer=c)
         .order_by("-created_at")
-        .prefetch_related("items")[:limit]
+        .prefetch_related("items__product", "items__variant")[:limit]
     )
     earned = dict(
         models.BeanLedger.objects.for_pharmacy(store.pk)
@@ -73,6 +73,13 @@ def purchases(store, c: models.Customer, limit: int = 30) -> list[dict]:
                 {
                     "name": (i.medication_name + (f" — {i.variant_label}" if i.variant_label else "")).strip(),
                     "qty": str(i.quantity.normalize()),
+                    # The drink's picture (the size's own, if it has one).
+                    # "b2://" keys are signed on the way out by the renderer.
+                    "image": (
+                        (getattr(i.variant, "image", "") if i.variant_id else "")
+                        or (i.product.image if i.product_id else "")
+                        or ""
+                    ),
                 }
                 for i in s.items.all()
             ],

@@ -515,6 +515,8 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "name",
             "phone",
             "gender",
+            "gender_set",
+            "birth_date",
             "avatar",
             "avatar_file",
             "clerk_id",

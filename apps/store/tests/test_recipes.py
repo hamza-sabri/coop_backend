@@ -730,6 +730,24 @@ class DrinkBuyersTests(RecipeBase):
         self.assertEqual(buyers[0]["avatar"], "https://x/a.png")
 
 
+class ReportsAgreeTests(RecipeBase):
+    """One drink, one number: the drinks table, the overview's most-ordered
+    list, the drink's own drawer and its "this month" box must all say the
+    same thing for the same month."""
+
+    def test_every_screen_counts_the_same_cups(self):
+        for q in (2, 1, 3):
+            self.sell(q)
+        get = lambda u: (lambda j: j.get("data", j))(self.api.get(u).json())  # noqa: E731
+        table = {r["product_id"]: r for r in get("/api/v1/reports/items/?period=month")["items"]}
+        drawer = get(f"/api/v1/reports/items/{self.latte.pk}/?period=month")
+        self.assertEqual(float(table[self.latte.pk]["qty"]), 6)
+        self.assertEqual(float(drawer["period"]["qty"]), 6)
+        self.assertEqual(float(drawer["cups"]["month"]), 6)
+        self.assertEqual(float(drawer["cups"]["today"]), 6)
+        self.assertEqual(float(drawer["cups"]["week"]), 6)
+
+
 class TillCatalogPictureTests(RecipeBase):
     def test_the_offline_catalogue_carries_the_picture(self):
         from django.core.cache import cache
@@ -918,6 +936,15 @@ class CustomerWebProfileTests(RecipeBase):
         self.assertEqual(len(b["purchases"]), 1)
         self.assertEqual(b["purchases"][0]["items"][0]["qty"], "2")
         self.assertGreater(b["purchases"][0]["points_earned"], 0)
+        self.assertIn("image", b["purchases"][0]["items"][0])
+
+    def test_staff_see_and_edit_gender_and_birthday(self):
+        r = self.api.patch(f"/api/v1/customers/{self.me.pk}/",
+                           {"gender": "female", "gender_set": True, "birth_date": "1999-05-01"}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        d = self.api.get(f"/api/v1/customers/{self.me.pk}/").json()
+        d = d.get("data", d)
+        self.assertEqual((d["gender"], d["gender_set"], d["birth_date"]), ("female", True, "1999-05-01"))
 
     def test_saves_gender_phone_birthday(self):
         r = self.web.patch("/api/v1/shop/me/", {"gender": "female", "phone": "+970 59-702-0201",

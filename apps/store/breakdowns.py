@@ -234,10 +234,14 @@ def item_detail(store_id, product_id: int, start: date, end: date) -> dict | Non
             "unit_profit": str(q2(price - cost)) if cost else None,
         },
         "last_sold_at": last_sold.isoformat() if last_sold else None,
+        # Calendar windows — the SAME day/week/month the reports use, so
+        # "هذا الشهر" here equals the month's number in the drinks table.
+        # (Rolling 7/30-day windows looked like the table's numbers but never
+        # matched them.)
         "cups": {
             "today": cups(today, today),
-            "week": cups(today - timedelta(days=6), today),
-            "month": cups(today - timedelta(days=29), today),
+            "week": cups(finance.resolve_range({"period": "week", "date": today.isoformat()})["start"], today),
+            "month": cups(today.replace(day=1), today),
         },
         "period": {
             "start": start.isoformat(), "end": end.isoformat(),
