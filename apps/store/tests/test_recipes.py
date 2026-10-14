@@ -949,6 +949,8 @@ class CustomerWebProfileTests(RecipeBase):
         self.assertEqual(b["purchases"][0]["items"][0]["qty"], "2")
         self.assertGreater(b["purchases"][0]["points_earned"], 0)
         self.assertIn("image", b["purchases"][0]["items"][0])
+        self.assertIn("subtotal", b["purchases"][0])
+        self.assertIn(b["purchases"][0]["payment"], ("cash", "card", "debt"))
 
     def test_staff_see_and_edit_gender_and_birthday(self):
         r = self.api.patch(f"/api/v1/customers/{self.me.pk}/",

@@ -67,6 +67,10 @@ def purchases(store, c: models.Customer, limit: int = 30) -> list[dict]:
             "at": s.created_at.isoformat(),
             "is_return": s.is_return,
             "total": str(s.discounted_total),
+            # The bill's breakdown, for the visit's detail sheet.
+            "subtotal": str(s.total),
+            "points_value": str(s.beans_value),
+            "payment": s.payment_method,
             "points_spent": s.beans_spent,
             "points_earned": int(earned.get(s.pk) or 0),
             "items": [
