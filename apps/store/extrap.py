@@ -240,6 +240,10 @@ def load(store, dump: dict, *, request=None, do_wipe: bool = False, dry_run: boo
         cat_of = {obj.pk: (obj.category.name if obj.category_id else "") for obj in by_src.values()}
 
         # ── sales (history only) ─────────────────────────────────────────
+        # Earlier runs stamped the importer as the seller; undo that.
+        models.Sale.objects.for_pharmacy(store.pk).filter(
+            note__startswith=NOTE, created_by__isnull=False
+        ).update(created_by=None)
         have = {
             n.split()[0]
             for n in models.Sale.objects.for_pharmacy(store.pk)
@@ -257,7 +261,9 @@ def load(store, dump: dict, *, request=None, do_wipe: bool = False, dry_run: boo
             sales.append(
                 models.Sale(
                     store=store,
-                    created_by=user,
+                    # Rung on Extra P, not by whoever ran the import: leaving
+                    # it empty keeps 7,000 old sales off one employee's board.
+                    created_by=None,
                     payment_method="card" if s.get("payment") == "card" else "cash",
                     is_return=bool(s.get("is_return")),
                     total=_dec(s.get("total")),
