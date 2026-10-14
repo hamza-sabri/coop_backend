@@ -73,6 +73,8 @@ def purchases(store, c: models.Customer, limit: int = 30) -> list[dict]:
                 {
                     "name": (i.medication_name + (f" — {i.variant_label}" if i.variant_label else "")).strip(),
                     "qty": str(i.quantity.normalize()),
+                    "price": str(i.unit_price),
+                    "line_total": str(i.line_total),
                     # The drink's picture (the size's own, if it has one).
                     # "b2://" keys are signed on the way out by the renderer.
                     "image": (

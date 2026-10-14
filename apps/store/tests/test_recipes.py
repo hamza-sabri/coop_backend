@@ -4,11 +4,15 @@ The fixture is a latte: 1 cup, 200 ml milk, 18 g beans. A large one has its
 own recipe with 300 ml. Prices: cups 100 for ₪10, milk ₪5 a litre, beans
 ₪95 a kilo — so one latte costs 0.10 + 1.00 + 1.71 = ₪2.81, exactly.
 """
+import io
+import json
+import os
 from datetime import date
 from decimal import Decimal
 from unittest import mock
 
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
@@ -979,3 +983,48 @@ class CustomerWebProfileTests(RecipeBase):
 
     def test_signed_out_is_refused(self):
         self.assertIn(APIClient().get("/api/v1/shop/me/").status_code, (401, 403))
+
+
+class SyncExtrapTests(RecipeBase):
+    """`sync_extrap` brings only what is new — new sales, and returns made
+    since on old ones — and never touches what is already here."""
+
+    def fake_rows(self):
+        sale = lambda i, ret="0.00": {  # noqa: E731
+            "id": i, "date": "13/10/2026", "reference_no": f"posr-{i}", "grand_total": "14.00",
+            "returned_amount": ret, "paymentType": "Cash",
+            "sale": json.dumps(["13/10/2026"] + ["x"] * 15 + ["14"] + ["0"] * 16),
+        }
+        return [sale(1), sale(2, ret="14.00"), sale(3)]
+
+    def run_sync(self, rows, **kw):
+        from django.core.management import call_command
+
+        items = {"0": ["لاتيه [L1]"], "1": [2], "6": [14]}
+        pay = [["13/10/2026 23:49:59"], ["spr"], [14], ["Cash"]]
+        products = [{"id": 7, "name": "لاتيه", "code": "L1", "category": "قهوة", "price": "7", "image_url": ""}]
+        with mock.patch("apps.store.extrap_sync.ExtraP.login"), \
+             mock.patch("apps.store.extrap_sync.ExtraP.all_sales", return_value=rows), \
+             mock.patch("apps.store.extrap_sync.ExtraP.products", return_value=products), \
+             mock.patch("apps.store.extrap_sync.ExtraP.details", return_value=(items, pay)), \
+             mock.patch.dict(os.environ, {"EXTRAP_PASSWORD": "x"}):
+            call_command("sync_extrap", self.store.slug, "--username", "u", stdout=io.StringIO(), **kw)
+
+    def notes(self):
+        return sorted(n.split()[0] for n in models.Sale.objects.for_pharmacy(self.store)
+                      .filter(note__startswith="extrap:").values_list("note", flat=True))
+
+    def test_brings_only_new_sales_and_late_returns(self):
+        self.run_sync(self.fake_rows()[:1])
+        self.assertEqual(self.notes(), ["extrap:1"])
+        self.run_sync(self.fake_rows())  # 2 and 3 are new; 2 also has a return
+        self.assertEqual(self.notes(), ["extrap:1", "extrap:2", "extrap:3", "extrap:R2"])
+        self.run_sync(self.fake_rows())  # nothing new
+        self.assertEqual(len(self.notes()), 4)
+        s = models.Sale.objects.for_pharmacy(self.store).get(note__startswith="extrap:3")
+        self.assertEqual((s.discounted_total, s.items.get().quantity), (D("14.00"), D("2")))
+        self.assertEqual(timezone.localtime(s.created_at).hour, 23)
+
+    def test_dry_run_changes_nothing(self):
+        self.run_sync(self.fake_rows(), dry_run=True)
+        self.assertEqual(self.notes(), [])
