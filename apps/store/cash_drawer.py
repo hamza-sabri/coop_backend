@@ -50,7 +50,7 @@ CENT = Decimal("0.01")
 
 #: The notes and coins in circulation, largest first. A count is a dict of
 #: these keys to how many; anything else is refused.
-DENOMINATIONS = ("200", "100", "50", "20", "10", "5", "2", "1", "0.5", "0.1")
+DENOMINATIONS = ("200", "100", "50", "20", "10", "5", "2", "1")
 
 
 def _is_owner(user) -> bool:
@@ -68,7 +68,7 @@ def _money(value, field: str, allow_zero: bool = True) -> Decimal:
 
 
 def _counts(raw) -> tuple[dict, Decimal]:
-    """{"200": 3, "0.5": 12} → (cleaned dict, total). Empty dict → 0."""
+    """{"200": 3, "5": 12} → (cleaned dict, total). Empty dict → 0."""
     if not raw:
         return {}, ZERO
     if not isinstance(raw, dict):

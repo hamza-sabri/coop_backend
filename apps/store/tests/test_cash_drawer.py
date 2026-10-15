@@ -81,10 +81,10 @@ class CashDrawerCountsTests(RecipeBase):
         return r.status_code, body.get("data", body)
 
     def test_counts_are_summed_and_kept(self):
-        code, s = self.post("open", {"counts": {"100": 1, "20": 2, "0.5": 4}, "opened_by": self.emp.pk})
+        code, s = self.post("open", {"counts": {"100": 1, "20": 2, "1": 2}, "opened_by": self.emp.pk})
         self.assertEqual(code, 201, s)
         self.assertEqual(s["opening_amount"], "142.00")
-        self.assertEqual(s["opening_counts"], {"100": 1, "20": 2, "0.5": 4})
+        self.assertEqual(s["opening_counts"], {"100": 1, "20": 2, "1": 2})
         self.assertEqual(s["opened_by_id"], self.emp.pk)  # picked, not the signed-in owner
         self.assertEqual(self.post("open", {"counts": {"7": 1}})[0], 400)  # no such note
 
