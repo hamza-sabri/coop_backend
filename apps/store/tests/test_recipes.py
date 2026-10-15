@@ -1169,3 +1169,22 @@ class StableSignedLinksTests(RecipeBase):
             a = uploads.resolve_stored_url("b2://products/x.jpg")
             b = uploads.resolve_stored_url("b2://products/x.jpg")
         self.assertEqual(a, b)  # one signature for the day → the browser's copy is reused
+
+
+class DeleteSalesPermissionTests(RecipeBase):
+    def test_employees_cannot_delete_sales_unless_allowed(self):
+        sale = self.sell(1, client=self.staff)
+        r = self.staff.delete(f"/api/v1/sales/{sale.pk}/")
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(models.Sale.objects.for_pharmacy(self.store).filter(pk=sale.pk).exists())
+        self.assertFalse(self.staff.get("/api/v1/auth/me/").json()["can_delete_sales"])
+        # The owner allows this employee, from the staff page.
+        r = self.api.patch(f"/api/v1/staff/{self.emp.pk}/", {"can_delete_sales": True}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.emp.refresh_from_db()
+        self.staff.force_authenticate(self.emp)
+        self.assertEqual(self.staff.delete(f"/api/v1/sales/{sale.pk}/").status_code, 200)
+
+    def test_owner_can_always_delete(self):
+        sale = self.sell(1)
+        self.assertEqual(self.api.delete(f"/api/v1/sales/{sale.pk}/").status_code, 200)

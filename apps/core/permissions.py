@@ -138,6 +138,18 @@ class IsSelfOrAdmin(BasePermission):
         return obj == request.user
 
 
+class CanDeleteSales(BasePermission):
+    """Owners, and employees the owner allowed to delete sales (staff page)."""
+
+    message = "حذف الفواتير غير مسموح لك — يمنحه المالك من صفحة الموظفين."
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user and user.is_authenticated and (
+            getattr(user, "is_superuser", False) or getattr(user, "may_delete_sales", False)
+        ))
+
+
 class CanEditPrices(BasePermission):
     """Owners, and employees the owner allowed to change prices (staff page)."""
 

@@ -25,6 +25,7 @@ import django_filters
 from apps.core.search import ArabicSearchFilter, text_q
 from apps.core.permissions import (
     ModuleEnabled,
+    CanDeleteSales,
     CanEditPrices,
     OwnerRequired,
     StoreRequired,
@@ -3107,6 +3108,10 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         # revenue is the owner's. Employees keep the invoice list itself.
         if getattr(self, "action", None) in ("bulk_delete", "stats", "day_summary"):
             perms.append(OwnerRequired())
+        # Deleting one sale takes its money out of every report: owners, and
+        # only the employees the owner allowed (staff page).
+        if getattr(self, "action", None) == "destroy":
+            perms.append(CanDeleteSales())
         return perms
 
     @action(detail=True, methods=["get", "post"], url_path="returns")
@@ -4074,6 +4079,22 @@ class StaffViewSet(viewsets.ModelViewSet):
         from apps.accounts.serializers import StaffSerializer
 
         return StaffSerializer
+
+    def get_permissions(self):
+        # `names` is the one thing an employee may read: who works here, to
+        # say who opened or closed the drawer. No roles, no phones, no plan.
+        if getattr(self, "action", None) == "names":
+            return [permissions.IsAuthenticated(), StoreResolved()]
+        return super().get_permissions()
+
+    @action(detail=False, methods=["get"])
+    def names(self, request):
+        rows = [
+            {"id": u.pk, "name": (u.display_name or "").strip() or u.username}
+            for u in self.get_queryset().filter(is_active=True)
+        ]
+        rows.sort(key=lambda r: r["name"])
+        return Response(rows)
 
     def get_queryset(self):
         from apps.accounts.models import User

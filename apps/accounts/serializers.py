@@ -27,6 +27,7 @@ class UserSerializer(serializers.ModelSerializer):
     is_owner = serializers.SerializerMethodField()
     #: Owner, or an employee the owner allowed to change prices.
     can_edit_prices = serializers.SerializerMethodField()
+    can_delete_sales = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -34,6 +35,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id",
             "is_owner",
             "can_edit_prices",
+            "can_delete_sales",
             "store",
             "pharmacy_name",
             "store_slug",
@@ -87,6 +89,9 @@ class UserSerializer(serializers.ModelSerializer):
 
     def get_can_edit_prices(self, obj) -> bool:
         return bool(getattr(obj, "may_edit_prices", False))
+
+    def get_can_delete_sales(self, obj) -> bool:
+        return bool(getattr(obj, "may_delete_sales", False))
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -177,6 +182,7 @@ class StaffSerializer(serializers.ModelSerializer):
             "role",
             "allowed_modules",
             "can_edit_prices",
+            "can_delete_sales",
             "is_active",
             "is_owner",
             "password",

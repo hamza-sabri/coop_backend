@@ -64,6 +64,9 @@ class User(AbstractUser):
     #: line prices and the total (discounts) at the till? Off by default; the
     #: owner turns it on per employee on the staff page. Owners always can.
     can_edit_prices = models.BooleanField(default=False)
+    #: May this employee delete (void) a sale? Off by default — a deleted sale
+    #: takes its money out of the reports. The owner turns it on per employee.
+    can_delete_sales = models.BooleanField(default=False)
     phone = models.CharField(max_length=20, blank=True, db_index=True)
     display_name = models.CharField(max_length=150, blank=True)
     # Uploaded profile image (stored on B2 when configured, else locally).
@@ -100,6 +103,10 @@ class User(AbstractUser):
         if self.is_superuser:
             return "الإدارة"
         return self.get_username().split("@", 1)[0]
+
+    @property
+    def may_delete_sales(self) -> bool:
+        return self.is_owner or bool(self.can_delete_sales)
 
     @property
     def may_edit_prices(self) -> bool:

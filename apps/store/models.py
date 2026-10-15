@@ -2285,6 +2285,17 @@ class CashSession(TimeStampedModel):
     counted_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     expected_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     note = models.CharField(max_length=255, blank=True)
+    #: How many of each note and coin went in / came out: {"200": 3, "0.5": 12}.
+    #: The amounts above are the sums; the counts are kept so a record can be
+    #: printed exactly as it was counted.
+    opening_counts = models.JSONField(default=dict, blank=True)
+    closing_counts = models.JSONField(default=dict, blank=True)
+    #: What the card terminal's own total said at closing, typed by the person
+    #: closing. Compared with the card sales the books hold.
+    card_counted = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    #: The breakdown frozen at closing (cash sales, refunds, moves…), so the
+    #: history never changes when an old sale is corrected later.
+    closing_figures = models.JSONField(default=dict, blank=True)
 
     objects = TenantManager()
     unguarded = models.Manager()
