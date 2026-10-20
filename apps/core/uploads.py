@@ -30,7 +30,7 @@ def store_upload(file, folder: str = "uploads", request=None) -> str:
     original = getattr(file, "name", "") or ""
     ext = os.path.splitext(original)[1].lower()
     key = f"{folder.strip('/')}/{uuid.uuid4().hex}{ext}"
-    code = _blurhash_of(file)
+    data = _bytes_of(file)
     saved_name = default_storage.save(key, file)
     if getattr(settings, "STORAGE_ENABLED", False):
         stored = f"{B2_SCHEME}{saved_name}"
@@ -38,15 +38,18 @@ def store_upload(file, folder: str = "uploads", request=None) -> str:
         stored = default_storage.url(saved_name)
         if request is not None and stored.startswith("/"):
             stored = request.build_absolute_uri(stored)
-    if code:
-        from apps.core import blurhash
+    if data:
+        # Blur code + small copy now, while the file is in memory.
+        try:
+            from apps.core import blurhash
 
-        blurhash.remember(stored, code)
+            blurhash.process(stored, data)
+        except Exception:  # noqa: BLE001 — never fails an upload
+            pass
     return stored
 
 
-def _blurhash_of(file) -> str | None:
-    """Hash the upload while it is still in memory (no download later)."""
+def _bytes_of(file) -> bytes | None:
     try:
         from apps.core import blurhash
 
@@ -56,8 +59,8 @@ def _blurhash_of(file) -> str | None:
         pos = file.tell() if hasattr(file, "tell") else 0
         data = file.read()
         file.seek(pos)
-        return blurhash.hash_bytes(data)
-    except Exception:  # noqa: BLE001 — a missing preview never fails an upload
+        return data
+    except Exception:  # noqa: BLE001
         try:
             file.seek(0)
         except Exception:  # noqa: BLE001

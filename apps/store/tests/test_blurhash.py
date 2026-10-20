@@ -121,3 +121,67 @@ class Flow(TestCase):
             r = self.api.get(f"/api/v1/products/{p.id}/")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["image"], "https://cdn.example.com/x.jpg")
+
+
+class SmallCopies(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.store = models.Store.objects.create(name="T", slug="bh-t")
+        cls.user = User.objects.create_user("bh-t", password="x", store=cls.store)
+
+    def setUp(self):
+        blurhash.reset_memory()
+        self.api = APIClient()
+        self.api.force_authenticate(self.user)
+
+    def test_big_upload_is_served_as_a_small_webp(self):
+        big = jpeg("big.jpg", size=(2268, 4032))
+        r = self.api.post("/api/v1/products/", {"name": "Big", "price": "5", "image_file": big}, format="multipart")
+        self.assertEqual(r.status_code, 201, r.content)
+        served = r.json()["image"]
+        self.assertIn("/thumbs/", served)
+        self.assertIn(".webp#bh=", served)
+        p = models.Product.objects.for_pharmacy(self.store).get()
+        self.assertNotIn("thumbs", p.image)  # the original is what is stored
+        from django.core.files.storage import default_storage
+
+        rel = served.split("/media/", 1)[1].split("#", 1)[0]
+        with default_storage.open(rel) as f:
+            im = Image.open(f)
+            self.assertEqual(im.format, "WEBP")
+            self.assertLessEqual(max(im.size), blurhash.THUMB_PX)
+
+    def test_small_upload_is_served_as_it_is(self):
+        r = self.api.post("/api/v1/products/", {"name": "Small", "price": "5", "image_file": jpeg()}, format="multipart")
+        self.assertNotIn("/thumbs/", r.json()["image"])
+        self.assertEqual(ImageHash.objects.get().thumb, blurhash.NO_THUMB)
+
+    def test_thumb_keeps_transparency(self):
+        buf = io.BytesIO()
+        Image.new("RGBA", (1600, 1600), (255, 0, 0, 0)).save(buf, "PNG")
+        out = blurhash.thumb_bytes(buf.getvalue())
+        self.assertEqual(Image.open(io.BytesIO(out)).mode, "RGBA")
+
+    def test_existing_rows_without_a_copy_are_redone_by_the_command(self):
+        url = "https://cdn.example.com/old.jpg"
+        models.Product.objects.create(store=self.store, name="Old", price=1, image=url)
+        ImageHash.objects.create(key=blurhash.identity(url), blurhash="LKO2?U%2Tw=w]~RBVZRi};RPxuwH", thumb="")
+        with mock.patch.object(blurhash, "fetch_bytes", return_value=jpeg(size=(1600, 1200)).getvalue()) as fetch, \
+                mock.patch.object(blurhash, "save_thumb", return_value="b2://thumbs/x.webp"):
+            call_command("blurhash_images", stdout=io.StringIO())
+        fetch.assert_called_once()
+        self.assertEqual(ImageHash.objects.get().thumb, "b2://thumbs/x.webp")
+
+    @override_settings(STORAGE_ENABLED=True, B2_BUCKET_NAME="coop-media")
+    def test_signed_link_echoed_back_is_never_stored(self):
+        p = models.Product.objects.create(store=self.store, name="S", price=1, image="b2://products/" + "a" * 32 + ".jpg")
+        # Our small copy, signed, echoed back by a client: the original stays.
+        p.image = "https://s3.eu-central-003.backblazeb2.com/coop-media/thumbs/" + "b" * 32 + ".webp?X-Amz-Signature=x#bh=abc"
+        p.save()
+        p.refresh_from_db()
+        self.assertEqual(p.image, "b2://products/" + "a" * 32 + ".jpg")
+        # Any other signed link becomes its stable stored form.
+        p.image = "https://s3.eu-central-003.backblazeb2.com/coop-media/products/" + "c" * 32 + ".jpg?X-Amz-Signature=y"
+        p.save()
+        p.refresh_from_db()
+        self.assertEqual(p.image, "b2://products/" + "c" * 32 + ".jpg")

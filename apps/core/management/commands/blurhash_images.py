@@ -1,4 +1,4 @@
-"""Give every stored picture its blurhash (run once; safe to re-run).
+"""Give every stored picture its blurhash and small copy (run once; safe to re-run).
 
     python manage.py blurhash_images            # hash what is missing
     python manage.py blurhash_images --dry-run  # only count
@@ -33,7 +33,9 @@ class Command(BaseCommand):
                     key = blurhash.identity(v)
                     if key and not blurhash._NOT_PICTURE.search(blurhash.strip(v).split("?", 1)[0]):
                         values.setdefault(key, blurhash.strip(v))
-        have = set(ImageHash.objects.filter(key__in=list(values)).values_list("key", flat=True))
+        have = set(
+            ImageHash.objects.filter(key__in=list(values)).exclude(thumb="").values_list("key", flat=True)
+        )
         todo = [(k, v) for k, v in values.items() if k not in have]
         if limit:
             todo = todo[:limit]

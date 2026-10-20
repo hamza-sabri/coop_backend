@@ -174,10 +174,75 @@ def identity(value: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Small copies. Phone photos arrive at 3000-4000px and several MB; drawn into
+# a 200px card they still cost the browser tens of MB of memory each to decode,
+# and a grid of them makes the whole app stutter while scrolling. Every picture
+# gets an 800px WebP copy (tens of KB), and THAT is what the API serves.
+
+THUMB_PX = 800
+#: "No copy needed" (the original is already small) — distinct from "" (not done yet).
+NO_THUMB = "-"
+
+
+def thumb_bytes(data: bytes) -> bytes | None:
+    """An 800px WebP of the picture, or None when the original is already small."""
+    try:
+        from PIL import Image, ImageOps
+
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        if max(w, h) <= THUMB_PX and len(data) <= 200 * 1024:
+            return None
+        try:
+            im.draft("RGB", (THUMB_PX, THUMB_PX))
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(im)
+        alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+        im = im.convert("RGBA" if alpha else "RGB")
+        im.thumbnail((THUMB_PX, THUMB_PX))
+        out = io.BytesIO()
+        im.save(out, "WEBP", quality=80, method=4)
+        return out.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        log.info("thumb: unreadable image (%s)", type(exc).__name__)
+        return None
+
+
+def save_thumb(original: str, data: bytes) -> str:
+    """Store the small copy; returns its stored value, or NO_THUMB."""
+    small = thumb_bytes(data)
+    if not small:
+        return NO_THUMB
+    import uuid
+
+    from django.core.files.base import ContentFile
+    from django.core.files.storage import default_storage
+
+    from apps.core.uploads import B2_SCHEME
+
+    original = strip(original)
+    if getattr(settings, "STORAGE_ENABLED", False):
+        prefix = B2_SCHEME
+    elif "/media/" in original:
+        # Local storage (development): same host as the original.
+        prefix = original.split("/media/", 1)[0] + "/media/"
+    else:
+        return NO_THUMB  # nowhere sensible to keep it
+    try:
+        saved = default_storage.save(f"thumbs/{uuid.uuid4().hex}.webp", ContentFile(small))
+    except Exception as exc:  # noqa: BLE001
+        log.info("thumb: could not store (%s)", type(exc).__name__)
+        return ""
+    return f"{prefix}{saved}"
+
+
+# ---------------------------------------------------------------------------
 # In-memory table, refreshed from the database every few minutes.
+# identity -> (blurhash, thumb)
 
 _lock = threading.Lock()
-_memo: dict[str, str] = {}
+_memo: dict[str, tuple[str, str]] = {}
 _loaded_at = 0.0
 _RELOAD = 300
 
@@ -191,14 +256,14 @@ def _ensure_loaded():
     try:
         from apps.core.models import ImageHash
 
-        rows = dict(ImageHash.objects.values_list("key", "blurhash"))
+        rows = {k: (h, t) for k, h, t in ImageHash.objects.values_list("key", "blurhash", "thumb")}
         with _lock:
             _memo.update(rows)
     except Exception as exc:  # noqa: BLE001
         log.info("blurhash: could not load codes (%s)", type(exc).__name__)
 
 
-def lookup(value) -> str | None:
+def entry(value) -> tuple[str, str] | None:
     key = identity(value)
     if not key:
         return None
@@ -206,16 +271,21 @@ def lookup(value) -> str | None:
     return _memo.get(key)
 
 
-def remember(value, code: str | None) -> None:
+def lookup(value) -> str | None:
+    e = entry(value)
+    return e[0] if e else None
+
+
+def remember(value, code: str | None, thumb: str = "") -> None:
     key = identity(value)
     if not key or not code:
         return
     with _lock:
-        _memo[key] = code
+        _memo[key] = (code, thumb)
     try:
         from apps.core.models import ImageHash
 
-        ImageHash.objects.update_or_create(key=key, defaults={"blurhash": code})
+        ImageHash.objects.update_or_create(key=key, defaults={"blurhash": code, "thumb": thumb})
     except Exception as exc:  # noqa: BLE001
         log.info("blurhash: could not save code (%s)", type(exc).__name__)
 
@@ -229,28 +299,41 @@ def reset_memory():
     _pending.clear()
 
 
+def done(e) -> bool:
+    return bool(e and e[0] and e[1])
+
+
 # ---------------------------------------------------------------------------
-# Serving: append the code to a URL.
+# Serving: the small copy instead of the original, with its code appended.
 
 def with_hash(url, stored=None):
-    """`url` with "#bh=<code>" when a code is known for it (or for `stored`).
-    Unknown pictures are queued to be hashed in the background."""
+    """What to hand the browser for a picture: its small copy when there is
+    one, plus "#bh=<code>". Pictures not processed yet are queued for the
+    background worker and served as they are meanwhile."""
     if not isinstance(url, str) or not url or _FRAG in url or url.startswith("data:"):
         return url
     try:
-        code = lookup(stored or url)
-        if code:
-            return f"{url}{_FRAG}{quote(code, safe='')}"
-        enqueue(stored or url)
+        e = entry(stored or url)
+        if not done(e):
+            enqueue(stored or url)
+        if not e:
+            return url
+        code, thumb = e
+        if thumb and thumb != NO_THUMB:
+            from apps.core.uploads import _resolve
+
+            small = _resolve(thumb)
+            if small:
+                url = small
+        return f"{url}{_FRAG}{quote(code, safe='')}" if code else url
     except Exception:  # noqa: BLE001
-        pass
-    return url
+        return url
 
 
 # ---------------------------------------------------------------------------
 # Fetching a picture's bytes, wherever it lives.
 
-MAX_BYTES = 8 * 1024 * 1024
+MAX_BYTES = 25 * 1024 * 1024
 
 
 def fetch_bytes(value: str) -> bytes | None:
@@ -266,7 +349,7 @@ def fetch_bytes(value: str) -> bytes | None:
         if value.startswith(("http://", "https://")):
             import requests
 
-            with requests.get(value, timeout=10, stream=True) as r:
+            with requests.get(value, timeout=15, stream=True) as r:
                 if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/"):
                     return None
                 data = r.raw.read(MAX_BYTES + 1, decode_content=True)
@@ -280,13 +363,18 @@ def fetch_bytes(value: str) -> bytes | None:
     return None
 
 
-def compute(value: str) -> str | None:
-    """Fetch, hash and store one picture. Returns the code (or None)."""
-    data = fetch_bytes(value)
-    code = hash_bytes(data) if data else None
+def process(value: str, data: bytes) -> str | None:
+    """Blurhash + small copy for one picture whose bytes we have."""
+    code = hash_bytes(data)
     if code:
-        remember(value, code)
+        remember(value, code, save_thumb(value, data))
     return code
+
+
+def compute(value: str) -> str | None:
+    """Fetch and process one picture. Returns the code (or None)."""
+    data = fetch_bytes(value)
+    return process(value, data) if data else None
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +425,7 @@ def _work():
     while True:
         value = _queue.get()
         try:
-            if not lookup(value):
+            if not done(entry(value)):
                 compute(value)
         except Exception:  # noqa: BLE001
             pass
@@ -367,11 +455,36 @@ def picture_fields(model) -> tuple[str, ...]:
     return _fields_cache[model]
 
 
+def _signed_to_stored(url: str) -> str | None:
+    """A signed storage URL (expires in days) back to its "b2://<key>"."""
+    from apps.core.uploads import B2_SCHEME
+
+    bucket = getattr(settings, "B2_BUCKET_NAME", "") or ""
+    parts = urlsplit(url)
+    path = unquote(parts.path).lstrip("/")
+    if bucket and path.startswith(bucket + "/"):
+        path = path[len(bucket) + 1:]
+    return f"{B2_SCHEME}{path}" if path else None
+
+
 def strip_picture_fields(sender, instance, **kwargs):
+    """Clients echo back the URLs they were served. Never store the "#bh="
+    fragment, and never a signed link (it expires): turn it back into the
+    stored form — and if it is only our small copy of the picture already
+    there, keep the original."""
     try:
         for name in picture_fields(sender):
             v = getattr(instance, name, None)
-            if isinstance(v, str) and _FRAG in v:
-                setattr(instance, name, strip(v))
+            if not isinstance(v, str) or not v:
+                continue
+            clean = strip(v)
+            if "X-Amz-" in clean and getattr(settings, "STORAGE_ENABLED", False):
+                stored = _signed_to_stored(clean)
+                if stored and stored.split("://", 1)[-1].startswith("thumbs/") and instance.pk:
+                    current = type(instance)._base_manager.filter(pk=instance.pk).values_list(name, flat=True).first()
+                    stored = current or stored
+                clean = stored or clean
+            if clean != v:
+                setattr(instance, name, clean)
     except Exception:  # noqa: BLE001
         pass

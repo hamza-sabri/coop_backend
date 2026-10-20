@@ -27,6 +27,9 @@ class ImageHash(models.Model):
 
     key = models.CharField(max_length=80, unique=True)
     blurhash = models.CharField(max_length=64)
+    #: Stored value of the 800px WebP copy that is served instead of the
+    #: original; "-" when the original is already small; "" not made yet.
+    thumb = models.CharField(max_length=300, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
