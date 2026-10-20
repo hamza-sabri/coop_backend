@@ -2572,6 +2572,14 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             response.data["app_link"] = result
         return response
 
+    @action(detail=True, methods=["post"], url_path="app-qr")
+    def app_qr(self, request, pk=None):
+        """POST /customers/<id>/app-qr/ — a 5-minute sign-in QR, no SMS."""
+        from apps.store import app_auth
+
+        customer = self.get_object()
+        return Response(app_auth.counter_qr(customer.store, customer, user=request.user))
+
     @action(detail=True, methods=["post"], url_path="send-app-link")
     def send_app_link(self, request, pk=None):
         """POST /customers/<id>/send-app-link/ — one SMS with a sign-in link."""
@@ -2587,7 +2595,17 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         invalidate_dashboard_cache(self.store_id)
         invalidate_customers_quick_cache(self.store_id)
 
+    @transaction.atomic
     def perform_destroy(self, instance):
+        # Invoices are kept (Sale.customer is SET_NULL); stamp who it was on
+        # each one first, so a deleted customer's bills still say whose they were.
+        from django.db.models import Value
+        from django.db.models.functions import Concat
+
+        who = " · ".join(x for x in (instance.name, instance.phone or "") if x)
+        models.Sale.objects.for_pharmacy(self.store_id).filter(customer=instance).update(
+            note=Concat(F("note"), Value(f" [زبون محذوف: {who}]"))
+        )
         instance.delete()
         invalidate_dashboard_cache(self.store_id)
         invalidate_customers_quick_cache(self.store_id)

@@ -285,3 +285,70 @@ class HandoffAndSessions(Base):
         token = self.signed_in()
         self.assertFalse(models.CustomerSession.objects.unscoped().filter(token_hash=token).exists())
         self.assertFalse(models.CustomerAuthCode.objects.unscoped().filter(code_hash="123456").exists())
+
+
+class CounterQr(Base):
+    def test_qr_signs_in_without_sms_and_dies_in_5_minutes(self):
+        c = models.Customer.objects.create(store=self.a, name="سامر", phone="0599123456")
+        # a pending SMS link must survive a QR being shown
+        with mock.patch.object(app_auth, "_link_token", return_value="SmsLink123"):
+            self.staff.post(f"/api/v1/customers/{c.pk}/send-app-link/")
+        r = self.staff.post(f"/api/v1/customers/{c.pk}/app-qr/")
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json()
+        self.assertTrue(body["qr"].startswith("data:image/svg+xml;base64,"))
+        self.assertEqual(body["expires_in"], 300)
+        sms_before = models.SmsLog.objects.unscoped().count()
+        token = body["url"].rsplit("/i/", 1)[1]
+        ok = self.anon.post("/api/v1/shop/auth/link/", {"store": "coop", "token": token}, format="json")
+        self.assertEqual(ok.status_code, 200, ok.content)
+        self.assertEqual(ok.json()["customer"]["id"], c.pk)
+        self.assertEqual(models.SmsLog.objects.unscoped().count(), sms_before)  # no SMS
+        still = self.anon.post("/api/v1/shop/auth/link/", {"store": "coop", "token": "SmsLink123"}, format="json")
+        self.assertEqual(still.status_code, 200)  # the texted link still works
+
+    def test_expired_qr_and_other_tenant(self):
+        c = models.Customer.objects.create(store=self.a, name="ب", phone="0599000001")
+        url = self.staff.post(f"/api/v1/customers/{c.pk}/app-qr/").json()["url"]
+        models.CustomerAuthCode.objects.unscoped().update(expires_at=timezone.now() - timedelta(seconds=1))
+        r = self.anon.post("/api/v1/shop/auth/link/", {"store": "coop", "token": url.rsplit("/i/", 1)[1]}, format="json")
+        self.assertEqual(r.status_code, 410)
+        other = models.Customer.objects.create(store=self.b, name="غريب", phone="0599000002")
+        self.assertEqual(self.staff.post(f"/api/v1/customers/{other.pk}/app-qr/").status_code, 404)
+
+
+class DeleteKeepsInvoices(Base):
+    def test_deleting_a_customer_keeps_their_invoices_with_name_and_phone(self):
+        from decimal import Decimal
+
+        c = models.Customer.objects.create(store=self.a, name="سامر", phone="0599123456")
+        sale = models.Sale.objects.create(store=self.a, customer=c, discounted_total=Decimal("12"), note="بدون سكر")
+        r = self.staff.delete(f"/api/v1/customers/{c.pk}/")
+        self.assertEqual(r.status_code, 204, r.content)
+        sale = models.Sale.objects.for_pharmacy(self.a.pk).get(pk=sale.pk)
+        self.assertIsNone(sale.customer_id)
+        self.assertIn("بدون سكر", sale.note)
+        self.assertIn("زبون محذوف: سامر · 0599123456", sale.note)
+
+
+class OneSmsOnly(Base):
+    def test_every_message_fits_one_sms_even_with_a_long_shop_name(self):
+        sent = []
+        real = app_auth.sms.send_as
+
+        def spy(to, msg, **kw):
+            sent.append(msg)
+            return real(to, msg, **kw)
+
+        self.a.name = "مقهى الأصدقاء الكبير للقهوة المختصة"
+        self.a.save()
+        c = models.Customer.objects.create(store=self.a, name="س", phone="0599123456")
+        with mock.patch.object(app_auth.sms, "send_as", side_effect=spy):
+            self.staff.post(f"/api/v1/customers/{c.pk}/send-app-link/")
+            self.age_logs()
+            self.otp()
+        self.assertEqual(len(sent), 2)
+        for msg in sent:
+            self.assertLessEqual(len(msg), 70, msg)
+            self.assertEqual(sms.segments(msg), 1, msg)
+        self.assertEqual(set(models.SmsLog.objects.unscoped().values_list("segments", flat=True)), {1})

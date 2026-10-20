@@ -63,6 +63,16 @@ def _link_token() -> str:
     return "".join(secrets.choice(_B62) for _ in range(10))
 
 
+def one_sms(*candidates: str) -> str:
+    """The first wording that fits ONE SMS (70 characters in Arabic). Every
+    extra 70 characters is billed as another SMS, so a long shop name drops
+    the friendly words before it ever costs double."""
+    for msg in candidates:
+        if sms.segments(msg) == 1:
+            return msg
+    return candidates[-1]
+
+
 def store_host(store: models.Store) -> str:
     return store.host or f"{store.slug}.{getattr(settings, 'PUBLIC_ROOT_DOMAIN', 'clinixa.cloud')}"
 
@@ -132,11 +142,13 @@ def _send(store, phone, msg, kind, customer=None, user=None) -> models.SmsLog:
     )
 
 
-def _new_code(store, phone, kind, secret, ttl, customer=None, user=None):
-    # One live code of a kind per number: a new one retires the old.
-    models.CustomerAuthCode.objects.unscoped().filter(
-        store=store, phone=phone, kind=kind, used_at__isnull=True
-    ).update(used_at=timezone.now())
+def _new_code(store, phone, kind, secret, ttl, customer=None, user=None, retire=True):
+    # One live code of a kind per number: a new one retires the old. (A QR on
+    # the counter screen does not retire a link already texted to them.)
+    if retire:
+        models.CustomerAuthCode.objects.unscoped().filter(
+            store=store, phone=phone, kind=kind, used_at__isnull=True
+        ).update(used_at=timezone.now())
     return models.CustomerAuthCode.objects.create(
         store=store, customer=customer, phone=phone, kind=kind,
         code_hash=_hash(kind, store.pk, secret), expires_at=timezone.now() + ttl,
@@ -243,7 +255,8 @@ def send_app_link(store, customer, user=None) -> dict:
     with transaction.atomic():
         _new_code(store, phone, models.CustomerAuthCode.Kind.INVITE, token, ttl,
                   customer=customer, user=user)
-        msg = f"{store.name}: نقاطك وطلباتك هنا {app_url(store)}/i/{token}"
+        url = f"{app_url(store)}/i/{token}"
+        msg = one_sms(f"{store.name}: نقاطك وطلباتك هنا {url}", f"{store.name}: نقاطك {url}", f"نقاطك: {url}", url)
         log = _send(store, phone, msg, models.SmsLog.Kind.INVITE, customer=customer, user=user)
         if log.status != models.SmsLog.Status.FAILED:
             customer.app_invited_at = timezone.now()
@@ -258,6 +271,33 @@ def send_app_link(store, customer, user=None) -> dict:
     if out["dry_run"] and settings.DEBUG:
         out["debug_link"] = f"{app_url(store)}/i/{token}"  # local testing only
     return out
+
+
+QR_TTL = timedelta(minutes=5)
+
+
+def counter_qr(store, customer, user=None) -> dict:
+    """A QR for the customer-facing screen: scan it in the shop and you are
+    signed in. Same one-time link as the SMS (/app/i/<token>), but no SMS at
+    all, and alive for 5 minutes only — it is on a screen anyone can see."""
+    import base64
+    import io
+
+    import qrcode
+    import qrcode.image.svg
+
+    token = _link_token()
+    _new_code(store, customer.phone or "", models.CustomerAuthCode.Kind.INVITE, token,
+              QR_TTL, customer=customer, user=user, retire=False)
+    url = f"{app_url(store)}/i/{token}"
+    img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=10, border=2)
+    buf = io.BytesIO()
+    img.save(buf)
+    return {
+        "url": url,
+        "qr": "data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode(),
+        "expires_in": int(QR_TTL.total_seconds()),
+    }
 
 
 # ---------------------------------------------------------- authentication
@@ -320,7 +360,11 @@ class OtpRequestView(_Public):
         with transaction.atomic():
             _new_code(store, phone, models.CustomerAuthCode.Kind.OTP, code, OTP_TTL)
             # Last line in the WebOTP format, so Android offers to fill it in.
-            msg = f"{store.name}: رمز الدخول {code}\n\n@{store_host(store)} #{code}"
+            msg = one_sms(
+                f"{store.name}: رمز الدخول {code}\n\n@{store_host(store)} #{code}",
+                f"رمز الدخول {code}\n\n@{store_host(store)} #{code}",
+                f"رمز الدخول {code}",
+            )
             log = _send(store, phone, msg, models.SmsLog.Kind.OTP)
         if log.status == models.SmsLog.Status.FAILED:
             return Response({"detail": "تعذّر إرسال الرسالة — جرّب بعد قليل"}, status=502)
