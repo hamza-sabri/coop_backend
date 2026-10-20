@@ -62,7 +62,10 @@ def send(local_phone: str, msg: str) -> SmsResult:
     # Palestinian numbers are reachable as 970… and, on some routes, 972….
     # If the provider refuses one form, try the other once (a refused
     # message is not billed).
-    if not res.ok and not res.dry_run and not res.response.startswith("error:"):
+    # (Not for account-level refusals — wrong IP, bad ID, no credit — where
+    # the other number would be refused just the same.)
+    account_level = res.response[:4] in ("H004", "H001", "H002", "H003") or "not allowed" in res.response.lower()
+    if not res.ok and not res.dry_run and not res.response.startswith("error:") and not account_level:
         alt = ("972" if to.startswith("970") else "970") + to[3:]
         log.info("sms retry with other country code (%s…)", alt[:6])
         res2 = send_as(alt, msg, sender=sender, api_id=api_id)

@@ -30,13 +30,39 @@ def store_upload(file, folder: str = "uploads", request=None) -> str:
     original = getattr(file, "name", "") or ""
     ext = os.path.splitext(original)[1].lower()
     key = f"{folder.strip('/')}/{uuid.uuid4().hex}{ext}"
+    code = _blurhash_of(file)
     saved_name = default_storage.save(key, file)
     if getattr(settings, "STORAGE_ENABLED", False):
-        return f"{B2_SCHEME}{saved_name}"
-    url = default_storage.url(saved_name)
-    if request is not None and url.startswith("/"):
-        url = request.build_absolute_uri(url)
-    return url
+        stored = f"{B2_SCHEME}{saved_name}"
+    else:
+        stored = default_storage.url(saved_name)
+        if request is not None and stored.startswith("/"):
+            stored = request.build_absolute_uri(stored)
+    if code:
+        from apps.core import blurhash
+
+        blurhash.remember(stored, code)
+    return stored
+
+
+def _blurhash_of(file) -> str | None:
+    """Hash the upload while it is still in memory (no download later)."""
+    try:
+        from apps.core import blurhash
+
+        size = getattr(file, "size", None)
+        if size is not None and size > blurhash.MAX_BYTES:
+            return None
+        pos = file.tell() if hasattr(file, "tell") else 0
+        data = file.read()
+        file.seek(pos)
+        return blurhash.hash_bytes(data)
+    except Exception:  # noqa: BLE001 — a missing preview never fails an upload
+        try:
+            file.seek(0)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 #: How long one signed link is handed out before a new one is made. Well
@@ -57,6 +83,13 @@ def resolve_stored_url(value) -> str:
     again and again — enough to exhaust Backblaze's daily download cap and
     break every picture in the shop until the next day.
     """
+    from apps.core import blurhash
+
+    value = blurhash.strip(value)
+    return blurhash.with_hash(_resolve(value), value)
+
+
+def _resolve(value) -> str:
     if isinstance(value, str) and value.startswith(B2_SCHEME):
         key = value[len(B2_SCHEME):]
         from django.core.cache import cache

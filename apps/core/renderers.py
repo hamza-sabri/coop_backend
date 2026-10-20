@@ -8,23 +8,35 @@ cards — each had to remember to, and some did not: the picture arrived as
 
 So it is done once, here, for every JSON response: any string value starting
 with "b2://" is replaced by its signed URL. Nothing a client sends is touched.
+
+Picture fields (image, logo, avatar… by name) that hold an ordinary URL also
+get their blurhash appended ("#bh=…", see apps/core/blurhash.py).
 """
+import re
+
 from rest_framework.renderers import JSONRenderer
 
+from apps.core import blurhash
 from apps.core.uploads import B2_SCHEME, resolve_stored_url
 
+_PICTURE_KEY = re.compile(r"image|logo|avatar|photo|picture|thumb", re.I)
 
-def _resolve(value, memo):
+
+def _resolve(value, memo, key=""):
     if isinstance(value, str):
         if value.startswith(B2_SCHEME):
             if value not in memo:
                 memo[value] = resolve_stored_url(value)
             return memo[value]
+        if key and value and _PICTURE_KEY.search(key) and value.startswith(("http://", "https://", "/media/")):
+            if value not in memo:
+                memo[value] = blurhash.with_hash(value)
+            return memo[value]
         return value
     if isinstance(value, dict):
-        return {k: _resolve(v, memo) for k, v in value.items()}
+        return {k: _resolve(v, memo, k if isinstance(k, str) else "") for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_resolve(v, memo) for v in value]
+        return [_resolve(v, memo, key) for v in value]
     return value
 
 

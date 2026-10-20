@@ -16,3 +16,18 @@ class TimeStampedModel(models.Model):
     class Meta:
         abstract = True
         ordering = ["-created_at"]
+
+
+class ImageHash(models.Model):
+    """Blurhash of one picture (see apps/core/blurhash.py).
+
+    `key` is the picture's identity — "f:<uuid>.<ext>" for our own uploads,
+    "url:<sha1>" for an outside URL. Not tenant data: a code is a few colours.
+    """
+
+    key = models.CharField(max_length=80, unique=True)
+    blurhash = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.key} → {self.blurhash}"

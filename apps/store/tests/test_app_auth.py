@@ -400,6 +400,21 @@ class ProductionQuirks(Base):
         tos = [c.kwargs["params"]["to"] for c in g.call_args_list]
         self.assertEqual(tos, ["970597968056", "972597968056"])
 
+    @override_settings(HTD_SMS_API_ID="k", SMS_DRY_RUN=False)
+    def test_ip_not_allowed_is_502_and_not_retried(self):
+        class R:
+            text = "H004|IP Not Allowed"
+
+        with mock.patch("requests.get", return_value=R()) as g:
+            res = sms.send("0597968056", "hi")
+        self.assertFalse(res.ok)
+        self.assertEqual(g.call_count, 1)
+        c = models.Customer.objects.create(store=self.a, name="N", phone="0597968056")
+        with mock.patch("requests.get", return_value=R()):
+            r = self.staff.post(f"/api/v1/customers/{c.id}/send-app-link/")
+        self.assertEqual(r.status_code, 502, r.content)
+        self.assertIn("H004", r.json()["detail"])
+
     def test_country_code_typed_with_the_leading_zero(self):
         for raw in ("9720597968056", "+970 0597968056", "972597968056", "00970597968056"):
             self.assertEqual(app_auth.clean_phone(raw), "0597968056", raw)

@@ -99,6 +99,13 @@ def _store_from_request(request) -> models.Store:
     return store
 
 
+class SmsFailed(exceptions.APIException):
+    """The SMS provider refused the message — not our server's fault (502)."""
+
+    status_code = 502
+    default_detail = "تعذّر إرسال الرسالة — جرّب بعد قليل"
+
+
 class SmsLimited(exceptions.APIException):
     status_code = 429
     default_detail = "طلبات كثيرة — جرّب بعد قليل"
@@ -264,7 +271,7 @@ def send_app_link(store, customer, user=None) -> dict:
             customer.app_invited_at = timezone.now()
             customer.save(update_fields=["app_invited_at", "updated_at"])
     if log.status == models.SmsLog.Status.FAILED:
-        raise exceptions.APIException(f"تعذّر إرسال الرسالة: {log.provider_response}")
+        raise SmsFailed(f"تعذّر إرسال الرسالة: {log.provider_response}")
     out = {
         "sent": True,
         "dry_run": log.status == models.SmsLog.Status.DRY_RUN,
