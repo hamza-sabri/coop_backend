@@ -355,6 +355,25 @@ class OneSmsOnly(Base):
 
 
 class ProductionQuirks(Base):
+    def test_phone_session_can_order_when_ordering_is_open(self):
+        self.otp()
+        token = self.verify().json()["token"]
+        p = models.Product.objects.create(store=self.a, name="لاتيه", price=12)
+        body = {"items": [{"product": p.id, "quantity": 2}], "client_uuid": "11111111-1111-1111-1111-111111111111"}
+        with override_settings(ONLINE_ORDERS_ENABLED=False):
+            r = self.as_customer(token).post("/api/v1/shop/orders/", body, format="json")
+        self.assertEqual(r.status_code, 403, r.content)
+        self.assertEqual(r.json()["code"], "ordering_closed")
+        with override_settings(ONLINE_ORDERS_ENABLED=True):
+            self.assertTrue(self.anon.get("/api/v1/public/ordering/?store=coop").json()["open"])
+            r = self.as_customer(token).post("/api/v1/shop/orders/", body, format="json")
+            self.assertIn(r.status_code, (200, 201), r.content)
+            order = models.Order.objects.for_pharmacy(self.a).get()
+            self.assertEqual(order.customer.phone, "0599123456")
+            # Only this store's orders, only this customer's.
+            mine = self.as_customer(token).get("/api/v1/shop/orders/").json()["results"]
+            self.assertEqual(len(mine), 1)
+
     def test_session_works_with_clerk_switched_on(self):
         # Production still has the old Clerk sign-in enabled. It must leave the
         # phone session's "cs_" token alone instead of rejecting it (401).
