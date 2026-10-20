@@ -1,6 +1,6 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from . import cafe_api, cash_drawer, extrap, views
+from . import app_auth, cafe_api, cash_drawer, extrap, views
 from apps.accounts.clerk import ClerkSyncView, ClerkWebhookView
 from apps.accounts.firebase import FirebaseSyncView
 
@@ -52,6 +52,13 @@ urlpatterns = router.urls + [
     # The signed-in customer's own points, tier and history. Clerk-authed —
     # this is the shop app's equivalent of /auth/me/, and the reason the home
     # screen no longer ships hardcoded numbers.
+    # Customer app sign-in by phone — see apps/store/app_auth.py.
+    path("shop/auth/otp/request/", app_auth.OtpRequestView.as_view(), name="shop-otp-request"),
+    path("shop/auth/otp/verify/", app_auth.OtpVerifyView.as_view(), name="shop-otp-verify"),
+    path("shop/auth/link/", app_auth.LinkRedeemView.as_view(), name="shop-link-redeem"),
+    path("shop/auth/handoff/", app_auth.HandoffCreateView.as_view(), name="shop-handoff-create"),
+    path("shop/auth/handoff/redeem/", app_auth.HandoffRedeemView.as_view(), name="shop-handoff-redeem"),
+    path("shop/auth/logout/", app_auth.LogoutView.as_view(), name="shop-logout"),
     path("shop/me/", views.ShopMeView.as_view(), name="shop-me"),
     # The customer places orders here and reads their own history back.
     path("shop/orders/", views.ShopOrdersView.as_view(), name="shop-orders"),

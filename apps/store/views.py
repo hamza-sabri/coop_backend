@@ -32,6 +32,7 @@ from apps.core.permissions import (
     StoreResolved,
 )
 
+from apps.store.app_auth import CustomerSessionAuthentication
 from apps.accounts.clerk import ClerkAuthentication, IsClerkCustomer
 from apps.accounts.firebase import (
     FirebaseAuthentication,
@@ -2543,9 +2544,43 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        serializer.save(store_id=self.store_id)
+        want_link = bool(serializer.validated_data.get("send_app_link"))
+        customer = serializer.save(store_id=self.store_id)
         invalidate_dashboard_cache(self.store_id)
         invalidate_customers_quick_cache(self.store_id)
+        # The app link goes out AFTER the customer exists. A failed SMS must
+        # never lose the customer the cashier just typed in: it is reported on
+        # the response, and the button next to the customer can retry.
+        self._link_result = None
+        if want_link and customer.phone and customer.app_registered_at is None:
+            from apps.store import app_auth
+
+            try:
+                self._link_result = app_auth.send_app_link(
+                    customer.store, customer, user=self.request.user
+                )
+            except Exception as exc:  # noqa: BLE001 — reported, never raised
+                detail = getattr(exc, "detail", None)
+                if isinstance(detail, dict):
+                    detail = detail.get("detail")
+                self._link_result = {"sent": False, "detail": str(detail or exc)}
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        result = getattr(self, "_link_result", None)
+        if result is not None and isinstance(response.data, dict):
+            response.data["app_link"] = result
+        return response
+
+    @action(detail=True, methods=["post"], url_path="send-app-link")
+    def send_app_link(self, request, pk=None):
+        """POST /customers/<id>/send-app-link/ — one SMS with a sign-in link."""
+        from apps.store import app_auth
+
+        customer = self.get_object()
+        out = app_auth.send_app_link(customer.store, customer, user=request.user)
+        invalidate_customers_quick_cache(self.store_id)
+        return Response(out)
 
     def perform_update(self, serializer):
         serializer.save()
@@ -2589,7 +2624,8 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 beans=Coalesce(F("loyalty__beans"), 0),
             )
             .values("id", "name", "phone", "avatar", "gender", "clerk_id", "firebase_uid", "created_at",
-                    "visits", "visits_30", "first_at", "last_at", "spent", "beans")
+                    "visits", "visits_30", "first_at", "last_at", "spent", "beans",
+                    "app_registered_at", "app_invited_at")
         )
         rows = []
         for c in qs:
@@ -2601,7 +2637,9 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
             row = {
                 "id": c["id"], "name": c["name"], "phone": c["phone"] or "",
                 "avatar": resolve_stored_url(c["avatar"]), "gender": c["gender"],
-                "app": bool(c["clerk_id"] or c["firebase_uid"]), "visits": c["visits"], "visits_30d": c["visits_30"],
+                "app": bool(c["clerk_id"] or c["firebase_uid"] or c["app_registered_at"]),
+                "app_invited_at": c["app_invited_at"].isoformat() if c["app_invited_at"] else None,
+                "visits": c["visits"], "visits_30d": c["visits_30"],
                 "last_visit": last.isoformat() if last else None, "days_since": since,
                 "joined": joined.isoformat(), "points": int(c["beans"] or 0),
                 "status": customer_status(c["visits"], (today - joined).days, since, c["visits_30"], gap),
@@ -2640,11 +2678,11 @@ class CustomerViewSet(StoreScopedMixin, viewsets.ModelViewSet):
                 "beans": c["loyalty__beans"] or 0,
                 # Someone who signed up in the app: the till sorts these first,
                 # because they are the ones whose points actually move.
-                "signed_up": bool(c["clerk_id"] or c["firebase_uid"]),
+                "signed_up": bool(c["clerk_id"] or c["firebase_uid"] or c["app_registered_at"]),
             }
             for c in self.get_queryset().values(
                 "id", "name", "phone", "outstanding", "avatar",
-                "loyalty__beans", "clerk_id", "firebase_uid",
+                "loyalty__beans", "clerk_id", "firebase_uid", "app_registered_at",
             )
         ]
         payload = {"count": len(rows), "results": rows}
@@ -4455,6 +4493,21 @@ class PurchaseOrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
 
 
 
+def app_store(request):
+    """Which store a customer-app request belongs to.
+
+    Phone sign-in carries its store in the session, so any café's customers
+    land in their own café. The older Firebase/Clerk sign-in (كوب only) keeps
+    resolving through CLERK_STORE_SLUG exactly as before.
+    """
+    sid = getattr(request, "app_store_id", None)
+    if sid:
+        return models.Store.objects.filter(pk=sid, is_active=True).first()
+    return models.Store.objects.filter(
+        slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
+    ).first()
+
+
 class ShopMeView(APIView):
     """The signed-in customer's own standing, for the PWA home screen.
 
@@ -4468,7 +4521,7 @@ class ShopMeView(APIView):
     staff session and must never be given one.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     #: NOT IsAuthenticated — a customer has no Django user. See IsAppCustomer.
     permission_classes = [IsAppCustomer]
 
@@ -4485,9 +4538,7 @@ class ShopMeView(APIView):
         if not ident:
             return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
 
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
 
@@ -4582,9 +4633,7 @@ class ShopMeView(APIView):
         ident = identity_filter(request)
         if not ident:
             return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
         customer = models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
@@ -4606,7 +4655,7 @@ class ShopOrdersView(APIView):
     comes from settings, never from the request, for the same reason.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     #: NOT IsAuthenticated — a customer has no Django user. See IsAppCustomer.
     permission_classes = [IsAppCustomer]
 
@@ -4614,9 +4663,7 @@ class ShopOrdersView(APIView):
         ident = identity_filter(request)
         if not ident:
             return None, None
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return None, None
         customer = (
@@ -4730,16 +4777,14 @@ class ShopDeviceView(APIView):
     family phone must not keep pushing one person's order to the other.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     permission_classes = [IsAppCustomer]
 
     def post(self, request):
         ident = identity_filter(request)
         if not ident:
             return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
         customer = (
@@ -4788,7 +4833,7 @@ class ShopOrderCancelView(APIView):
     ledger key makes a double-tap on a bad connection idempotent.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     permission_classes = [IsAppCustomer]
 
     @transaction.atomic
@@ -4796,9 +4841,7 @@ class ShopOrderCancelView(APIView):
         ident = identity_filter(request)
         if not ident:
             return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return Response({"detail": "المقهى غير متاح حالياً"}, status=503)
         customer = (
@@ -4843,16 +4886,14 @@ class ShopUsualView(APIView):
     macchiato daily and tried one iced tea last Friday wants the macchiato.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     permission_classes = [IsAppCustomer]
 
     def get(self, request):
         ident = identity_filter(request)
         if not ident:
             return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return Response({"results": []})
         customer = (
@@ -4884,16 +4925,14 @@ class ShopNotificationsView(APIView):
     turned their phone off, or was in a lift.
     """
 
-    authentication_classes = [FirebaseAuthentication, ClerkAuthentication]
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
     permission_classes = [IsAppCustomer]
 
     def _resolve(self, request):
         ident = identity_filter(request)
         if not ident:
             return None, None
-        store = models.Store.objects.filter(
-            slug=getattr(settings, "CLERK_STORE_SLUG", "koup")
-        ).first()
+        store = app_store(request)
         if store is None:
             return None, None
         return store, (

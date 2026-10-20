@@ -87,6 +87,9 @@ class Store(TimeStampedModel):
     # `ModuleEnabled` permission on every module-owned endpoint. When a plan
     # is set this list becomes the tenant's à-la-carte EXTRAS on top of it.
     enabled_modules = models.JSONField(default=list, blank=True)
+    #: SMS sender name for this shop (must be approved by the SMS provider).
+    #: Empty = the platform default (settings.HTD_SMS_SENDER).
+    sms_sender = models.CharField(max_length=11, blank=True)
     # Store-wide default for the expiry alert window: a product is flagged
     # "near expiry" when it's within this many days of its expiry date. A
     # product may override it per-row (Product.expiry_alert_days).
@@ -554,6 +557,11 @@ class Customer(TimeStampedModel):
     client_uuid = models.CharField(
         max_length=64, null=True, blank=True, default=None, db_index=True
     )
+    #: First time they signed in to the customer app by phone (SMS code or
+    #: the link staff sent). The dashboard's "in the app" badge.
+    app_registered_at = models.DateTimeField(null=True, blank=True)
+    #: Last time staff sent them the app link by SMS.
+    app_invited_at = models.DateTimeField(null=True, blank=True)
 
     objects = TenantManager()  # reads require .for_pharmacy() / .unscoped()
     unguarded = models.Manager()  # Django internals only — never app code
@@ -2430,3 +2438,107 @@ class RecipeLine(TimeStampedModel):
 
     def __str__(self):
         return f"{self.product_id}/{self.variant_id or '-'}: {self.quantity} × {self.item_id}"
+
+
+# ---------------------------------------------------------------------------
+# Customer app sign-in by phone (SMS). See apps/store/app_auth.py.
+
+
+class SmsLog(TimeStampedModel):
+    """Every SMS sent (or attempted) — per store, for the bill and for limits."""
+
+    class Kind(models.TextChoices):
+        OTP = "otp", "OTP"
+        INVITE = "invite", "App link"
+
+    class Status(models.TextChoices):
+        SENT = "sent", "Sent"
+        FAILED = "failed", "Failed"
+        DRY_RUN = "dry_run", "Dry run (not sent)"
+
+    store = models.ForeignKey(Store, related_name="sms_logs", on_delete=models.CASCADE)
+    customer = models.ForeignKey(
+        "Customer", related_name="sms_logs", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    phone = models.CharField(max_length=20, db_index=True)
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    status = models.CharField(max_length=10, choices=Status.choices)
+    segments = models.PositiveSmallIntegerField(default=1)
+    provider_response = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        indexes = [models.Index(fields=["store", "created_at"])]
+
+
+class CustomerAuthCode(TimeStampedModel):
+    """A one-time secret that proves who a customer is, three kinds:
+
+    - otp:     6 digits sent by SMS when they sign in from the site.
+    - invite:  the token inside the link staff send — the link IS the code,
+               so a customer added at the counter never pays for a 2nd SMS.
+    - handoff: 6 digits shown in Safari for the iPhone home-screen app,
+               which does not share Safari's sign-in. No SMS at all.
+
+    Only a hash is stored. Single use, expiring, with a cap on wrong tries.
+    """
+
+    class Kind(models.TextChoices):
+        OTP = "otp", "SMS code"
+        INVITE = "invite", "App link"
+        HANDOFF = "handoff", "Safari to home screen"
+
+    store = models.ForeignKey(Store, related_name="auth_codes", on_delete=models.CASCADE)
+    customer = models.ForeignKey(
+        "Customer", related_name="auth_codes", null=True, blank=True, on_delete=models.CASCADE
+    )
+    phone = models.CharField(max_length=20, db_index=True)
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    code_hash = models.CharField(max_length=64, db_index=True)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="+", null=True, blank=True,
+        on_delete=models.SET_NULL,
+    )
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        indexes = [models.Index(fields=["store", "phone", "kind", "created_at"])]
+
+
+class CustomerSession(TimeStampedModel):
+    """A signed-in customer app on one device. The phone keeps the raw token
+    (localStorage); we keep its hash. Long-lived on purpose — every new
+    sign-in costs an SMS — and revocable."""
+
+    store = models.ForeignKey(Store, related_name="customer_sessions", on_delete=models.CASCADE)
+    customer = models.ForeignKey(
+        "Customer", related_name="app_sessions", on_delete=models.CASCADE
+    )
+    token_hash = models.CharField(max_length=64, unique=True)
+    via = models.CharField(max_length=10, choices=CustomerAuthCode.Kind.choices)
+    expires_at = models.DateTimeField()
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    user_agent = models.CharField(max_length=200, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"

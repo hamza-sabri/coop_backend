@@ -195,6 +195,7 @@ class IsAppCustomer(permissions.BasePermission):
         return bool(
             getattr(request, "firebase_uid", None)
             or getattr(request, "clerk_id", None)
+            or getattr(request, "app_customer_id", None)
         )
 
 
@@ -204,6 +205,11 @@ def identity_filter(request):
     Firebase wins when both are present, which happens for exactly one request:
     the first call after a Clerk user migrates to the app.
     """
+    # Phone sign-in (apps/store/app_auth.py): the session names the customer
+    # row itself, and the store it belongs to (see app_store()).
+    cid = getattr(request, "app_customer_id", None)
+    if cid:
+        return {"pk": cid}
     uid = getattr(request, "firebase_uid", None)
     if uid:
         return {"firebase_uid": uid}

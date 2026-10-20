@@ -535,6 +535,8 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
     points = serializers.SerializerMethodField()
     tier = serializers.CharField(source="loyalty.tier", read_only=True, default="single")
     signed_up = serializers.SerializerMethodField()
+    #: On create: text them the app link (one SMS that signs them in).
+    send_app_link = serializers.BooleanField(write_only=True, required=False, default=False)
     # Declared explicitly (instead of the auto unique validator) so blanks map to
     # NULL and uniqueness only applies to real numbers.
     phone = serializers.CharField(
@@ -558,6 +560,9 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "points",
             "tier",
             "signed_up",
+            "send_app_link",
+            "app_registered_at",
+            "app_invited_at",
             "notes",
             "status",
             "outstanding",
@@ -565,7 +570,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at", "app_registered_at", "app_invited_at"]
 
     def get_points(self, obj) -> int:
         """The annotation when it is there, the loyalty row when it is not.
@@ -582,6 +587,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
         return int(getattr(profile, "beans", 0) or 0)
 
     def create(self, validated_data):
+        validated_data.pop("send_app_link", None)  # handled by the view, after save
         adopt = validated_data.pop("_adopt", None)
         cu = validated_data.get("client_uuid")
         if cu:
@@ -596,6 +602,10 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
                 adopt.save(update_fields=["client_uuid", "updated_at"])
             return adopt
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("send_app_link", None)
+        return super().update(instance, validated_data)
 
     def validate_phone(self, value):
         # Empty phone -> NULL, so many customers may have no phone at all.
@@ -658,7 +668,7 @@ class CustomerSerializer(ImageUploadMixin, serializers.ModelSerializer):
 
     def get_signed_up(self, obj) -> bool:
         """Did they come in through the app, or add at the counter?"""
-        return bool(obj.clerk_id or obj.firebase_uid)
+        return bool(obj.clerk_id or obj.firebase_uid or obj.app_registered_at)
 
 class DebtItemSerializer(serializers.ModelSerializer):
     """A single med line inside a debt. `line_total` is computed server-side."""

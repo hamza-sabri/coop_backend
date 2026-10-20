@@ -350,14 +350,13 @@ class LoginIsolation(TwoCafes):
         self.assertNotIn("لاتيه", body_b)
 
 
-class AppCustomersAreSingleCafe(TwoCafes):
-    """Documents TODAY's limit, so nobody assumes otherwise: the customer app
-    endpoints (/shop/*, Firebase/Clerk sync) serve the ONE café named by
-    CLERK_STORE_SLUG. A second café can use the POS, menu, reports and staff
-    fully isolated, but not the loyalty phone app, until those endpoints take
-    the store from the request."""
+class AppCustomersFollowTheirSession(TwoCafes):
+    """The customer app endpoints (/shop/*) take the store from the phone
+    sign-in session (apps/store/app_auth.py), so each café's customers land in
+    their own café. Only the older Firebase/Clerk sign-in still resolves
+    through CLERK_STORE_SLUG. Behaviour is covered in test_app_auth."""
 
-    def test_shop_endpoints_are_pinned_to_the_deployments_cafe(self):
+    def test_shop_endpoints_resolve_the_store_per_request(self):
         import inspect
 
         from apps.store import views
@@ -365,4 +364,7 @@ class AppCustomersAreSingleCafe(TwoCafes):
         for name in ("ShopMeView", "ShopOrdersView", "ShopDeviceView", "ShopUsualView",
                      "ShopNotificationsView", "ShopOrderCancelView"):
             with self.subTest(view=name):
-                self.assertIn("CLERK_STORE_SLUG", inspect.getsource(getattr(views, name)))
+                src = inspect.getsource(getattr(views, name))
+                self.assertIn("app_store(request)", src)
+                self.assertIn("CustomerSessionAuthentication", src)
+                self.assertNotIn("CLERK_STORE_SLUG", src)
