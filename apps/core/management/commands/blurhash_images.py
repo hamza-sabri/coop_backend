@@ -34,7 +34,7 @@ class Command(BaseCommand):
                     if key and not blurhash._NOT_PICTURE.search(blurhash.strip(v).split("?", 1)[0]):
                         values.setdefault(key, blurhash.strip(v))
         have = set(
-            ImageHash.objects.filter(key__in=list(values)).exclude(thumb="").values_list("key", flat=True)
+            ImageHash.objects.filter(key__in=list(values), thumb=blurhash.IN_DB).values_list("key", flat=True)
         )
         todo = [(k, v) for k, v in values.items() if k not in have]
         if limit:

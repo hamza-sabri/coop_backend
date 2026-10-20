@@ -20,6 +20,7 @@ request or a save — every path swallows its own errors.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import io
 import logging
@@ -174,25 +175,31 @@ def identity(value: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Small copies. Phone photos arrive at 3000-4000px and several MB; drawn into
-# a 200px card they still cost the browser tens of MB of memory each to decode,
-# and a grid of them makes the whole app stutter while scrolling. Every picture
-# gets an 800px WebP copy (tens of KB), and THAT is what the API serves.
+# Small copies, served by this API.
+#
+# Phone photos arrive at 3000-4000px; drawn into a 200px card they still cost
+# the browser tens of MB each to decode, and a grid of them makes the whole app
+# stutter. Every picture gets an 800px WebP copy (tens of KB) kept IN THE
+# DATABASE and served from /api/v1/img/<token>.webp under an address that never
+# changes — so each device downloads a picture once and keeps it for good.
+#
+# Serving straight from Backblaze with signed links meant a new address every
+# day, every device re-downloading every picture daily, and the account's
+# daily download cap running out (all pictures broken until midnight). Now
+# Backblaze is read only when a picture is first processed.
 
 THUMB_PX = 800
-#: "No copy needed" (the original is already small) — distinct from "" (not done yet).
-NO_THUMB = "-"
+#: ImageHash.thumb when the copy lives in the database (served by token).
+IN_DB = "db"
 
 
 def thumb_bytes(data: bytes) -> bytes | None:
-    """An 800px WebP of the picture, or None when the original is already small."""
+    """An at-most-800px WebP of the picture (every picture, even small ones,
+    so all of them are served from here)."""
     try:
         from PIL import Image, ImageOps
 
         im = Image.open(io.BytesIO(data))
-        w, h = im.size
-        if max(w, h) <= THUMB_PX and len(data) <= 200 * 1024:
-            return None
         try:
             im.draft("RGB", (THUMB_PX, THUMB_PX))
         except Exception:
@@ -209,37 +216,9 @@ def thumb_bytes(data: bytes) -> bytes | None:
         return None
 
 
-def save_thumb(original: str, data: bytes) -> str:
-    """Store the small copy; returns its stored value, or NO_THUMB."""
-    small = thumb_bytes(data)
-    if not small:
-        return NO_THUMB
-    import uuid
-
-    from django.core.files.base import ContentFile
-    from django.core.files.storage import default_storage
-
-    from apps.core.uploads import B2_SCHEME
-
-    original = strip(original)
-    if getattr(settings, "STORAGE_ENABLED", False):
-        prefix = B2_SCHEME
-    elif "/media/" in original:
-        # Local storage (development): same host as the original.
-        prefix = original.split("/media/", 1)[0] + "/media/"
-    else:
-        return NO_THUMB  # nowhere sensible to keep it
-    try:
-        saved = default_storage.save(f"thumbs/{uuid.uuid4().hex}.webp", ContentFile(small))
-    except Exception as exc:  # noqa: BLE001
-        log.info("thumb: could not store (%s)", type(exc).__name__)
-        return ""
-    return f"{prefix}{saved}"
-
-
 # ---------------------------------------------------------------------------
 # In-memory table, refreshed from the database every few minutes.
-# identity -> (blurhash, thumb)
+# identity -> (blurhash, token)   (the image bytes are never held in memory)
 
 _lock = threading.Lock()
 _memo: dict[str, tuple[str, str]] = {}
@@ -256,7 +235,10 @@ def _ensure_loaded():
     try:
         from apps.core.models import ImageHash
 
-        rows = {k: (h, t) for k, h, t in ImageHash.objects.values_list("key", "blurhash", "thumb")}
+        rows = {
+            k: (h, tok if t == IN_DB and tok else "")
+            for k, h, t, tok in ImageHash.objects.values_list("key", "blurhash", "thumb", "token")
+        }
         with _lock:
             _memo.update(rows)
     except Exception as exc:  # noqa: BLE001
@@ -276,18 +258,25 @@ def lookup(value) -> str | None:
     return e[0] if e else None
 
 
-def remember(value, code: str | None, thumb: str = "") -> None:
+def remember(value, code: str | None, small: bytes | None = None) -> None:
     key = identity(value)
     if not key or not code:
         return
-    with _lock:
-        _memo[key] = (code, thumb)
+    import secrets
+
+    token = secrets.token_hex(16) if small else ""
     try:
         from apps.core.models import ImageHash
 
-        ImageHash.objects.update_or_create(key=key, defaults={"blurhash": code, "thumb": thumb})
+        defaults = {"blurhash": code, "source": strip(value)[:1000]}
+        if small:
+            defaults.update(thumb=IN_DB, token=token, small=small)
+        ImageHash.objects.update_or_create(key=key, defaults=defaults)
     except Exception as exc:  # noqa: BLE001
         log.info("blurhash: could not save code (%s)", type(exc).__name__)
+        return
+    with _lock:
+        _memo[key] = (code, token)
 
 
 def reset_memory():
@@ -304,30 +293,62 @@ def done(e) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Serving: the small copy instead of the original, with its code appended.
+# Serving: our own small copy, with its code appended.
+
+_base: contextvars.ContextVar[str] = contextvars.ContextVar("blurhash_base", default="")
+
+
+class RequestBaseMiddleware:
+    """Remembers this API's own address for the request, so picture URLs can
+    point back here (no request object reaches the serializers' helpers)."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        try:
+            base = request.build_absolute_uri("/").rstrip("/")
+            if not settings.DEBUG and base.startswith("http://"):
+                base = "https://" + base[len("http://"):]
+        except Exception:  # noqa: BLE001
+            base = ""
+        tok = _base.set(base)
+        try:
+            return self.get_response(request)
+        finally:
+            _base.reset(tok)
+
+
+def image_url(token: str) -> str:
+    base = getattr(settings, "PUBLIC_API_URL", "") or _base.get()
+    return f"{base.rstrip('/')}/api/v1/img/{token}.webp" if base else ""
+
 
 def with_hash(url, stored=None):
-    """What to hand the browser for a picture: its small copy when there is
+    """What to hand the browser for a picture: our small copy when there is
     one, plus "#bh=<code>". Pictures not processed yet are queued for the
     background worker and served as they are meanwhile."""
     if not isinstance(url, str) or not url or _FRAG in url or url.startswith("data:"):
         return url
+    if _IMG_PATH.search(url):
+        return url  # already one of ours
     try:
         e = entry(stored or url)
         if not done(e):
             enqueue(stored or url)
         if not e:
             return url
-        code, thumb = e
-        if thumb and thumb != NO_THUMB:
-            from apps.core.uploads import _resolve
-
-            small = _resolve(thumb)
-            if small:
-                url = small
+        code, token = e
+        if token:
+            mine = image_url(token)
+            if mine:
+                url = mine
         return f"{url}{_FRAG}{quote(code, safe='')}" if code else url
     except Exception:  # noqa: BLE001
         return url
+
+
+_IMG_PATH = re.compile(r"/api/v1/img/([0-9a-f]{32})\.webp")
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +388,7 @@ def process(value: str, data: bytes) -> str | None:
     """Blurhash + small copy for one picture whose bytes we have."""
     code = hash_bytes(data)
     if code:
-        remember(value, code, save_thumb(value, data))
+        remember(value, code, thumb_bytes(data))
     return code
 
 
@@ -478,6 +499,15 @@ def strip_picture_fields(sender, instance, **kwargs):
             if not isinstance(v, str) or not v:
                 continue
             clean = strip(v)
+            m = _IMG_PATH.search(clean)
+            if m:
+                from apps.core.models import ImageHash
+
+                src = ImageHash.objects.filter(token=m.group(1)).values_list("source", flat=True).first()
+                if src:
+                    clean = src
+                elif instance.pk:
+                    clean = type(instance)._base_manager.filter(pk=instance.pk).values_list(name, flat=True).first() or ""
             if "X-Amz-" in clean and getattr(settings, "STORAGE_ENABLED", False):
                 stored = _signed_to_stored(clean)
                 if stored and stored.split("://", 1)[-1].startswith("thumbs/") and instance.pk:

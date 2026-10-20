@@ -20,13 +20,14 @@ from django.apps import apps as django_apps
 from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
-from django.urls import include, path
+from django.urls import include, path, re_path
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularRedocView,
     SpectacularSwaggerView,
 )
 
+from apps.core import views as core_views
 from apps.core.views import healthz
 
 
@@ -48,6 +49,8 @@ def _discover_app_urls():
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    # Pictures' small copies (apps/core/blurhash.py) — before the API include.
+    re_path(r"^api/v1/img/(?P<token>[0-9a-f]{32})\.webp$", core_views.small_image, name="small-image"),
     # Liveness probe (DB-free) — used by Docker/Dokploy/Traefik health checks
     path("healthz/", healthz, name="healthz"),
     # Auth (JWT)

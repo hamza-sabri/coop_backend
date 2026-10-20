@@ -134,27 +134,41 @@ class SmallCopies(TestCase):
         self.api = APIClient()
         self.api.force_authenticate(self.user)
 
-    def test_big_upload_is_served_as_a_small_webp(self):
+    def test_big_upload_is_served_as_a_small_webp_from_this_api(self):
         big = jpeg("big.jpg", size=(2268, 4032))
         r = self.api.post("/api/v1/products/", {"name": "Big", "price": "5", "image_file": big}, format="multipart")
         self.assertEqual(r.status_code, 201, r.content)
         served = r.json()["image"]
-        self.assertIn("/thumbs/", served)
-        self.assertIn(".webp#bh=", served)
+        self.assertRegex(served, r"^https?://testserver/api/v1/img/[0-9a-f]{32}\.webp#bh=")
         p = models.Product.objects.for_pharmacy(self.store).get()
-        self.assertNotIn("thumbs", p.image)  # the original is what is stored
-        from django.core.files.storage import default_storage
+        self.assertNotIn("/img/", p.image)  # the original is what is stored
+        # Anyone can load it (an <img> sends no token), and keep it for good.
+        got = APIClient().get(served.split("testserver", 1)[1].split("#", 1)[0])
+        self.assertEqual(got.status_code, 200)
+        self.assertEqual(got["Content-Type"], "image/webp")
+        self.assertIn("immutable", got["Cache-Control"])
+        im = Image.open(io.BytesIO(got.content))
+        self.assertLessEqual(max(im.size), blurhash.THUMB_PX)
+        # Same address on every later response (browsers can cache it).
+        blurhash.reset_memory()
+        again = self.api.get(f"/api/v1/products/{p.id}/").json()["image"]
+        self.assertEqual(again, served)
 
-        rel = served.split("/media/", 1)[1].split("#", 1)[0]
-        with default_storage.open(rel) as f:
-            im = Image.open(f)
-            self.assertEqual(im.format, "WEBP")
-            self.assertLessEqual(max(im.size), blurhash.THUMB_PX)
-
-    def test_small_upload_is_served_as_it_is(self):
+    def test_small_upload_is_served_from_this_api_too(self):
         r = self.api.post("/api/v1/products/", {"name": "Small", "price": "5", "image_file": jpeg()}, format="multipart")
-        self.assertNotIn("/thumbs/", r.json()["image"])
-        self.assertEqual(ImageHash.objects.get().thumb, blurhash.NO_THUMB)
+        self.assertIn("/api/v1/img/", r.json()["image"])
+        self.assertEqual(ImageHash.objects.get().thumb, blurhash.IN_DB)
+
+    def test_unknown_token_is_404(self):
+        self.assertEqual(APIClient().get("/api/v1/img/" + "0" * 32 + ".webp").status_code, 404)
+
+    def test_our_url_echoed_back_keeps_the_original(self):
+        r = self.api.post("/api/v1/products/", {"name": "E", "price": "5", "image_file": jpeg()}, format="multipart")
+        pid, served = r.json()["id"], r.json()["image"]
+        original = models.Product.objects.for_pharmacy(self.store).get(pk=pid).image
+        r = self.api.patch(f"/api/v1/products/{pid}/", {"image": served}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(models.Product.objects.for_pharmacy(self.store).get(pk=pid).image, original)
 
     def test_thumb_keeps_transparency(self):
         buf = io.BytesIO()
@@ -166,11 +180,12 @@ class SmallCopies(TestCase):
         url = "https://cdn.example.com/old.jpg"
         models.Product.objects.create(store=self.store, name="Old", price=1, image=url)
         ImageHash.objects.create(key=blurhash.identity(url), blurhash="LKO2?U%2Tw=w]~RBVZRi};RPxuwH", thumb="")
-        with mock.patch.object(blurhash, "fetch_bytes", return_value=jpeg(size=(1600, 1200)).getvalue()) as fetch, \
-                mock.patch.object(blurhash, "save_thumb", return_value="b2://thumbs/x.webp"):
+        with mock.patch.object(blurhash, "fetch_bytes", return_value=jpeg(size=(1600, 1200)).getvalue()) as fetch:
             call_command("blurhash_images", stdout=io.StringIO())
         fetch.assert_called_once()
-        self.assertEqual(ImageHash.objects.get().thumb, "b2://thumbs/x.webp")
+        row = ImageHash.objects.get()
+        self.assertEqual(row.thumb, blurhash.IN_DB)
+        self.assertTrue(row.token and row.small)
 
     @override_settings(STORAGE_ENABLED=True, B2_BUCKET_NAME="coop-media")
     def test_signed_link_echoed_back_is_never_stored(self):

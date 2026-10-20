@@ -30,6 +30,12 @@ class ImageHash(models.Model):
     #: Stored value of the 800px WebP copy that is served instead of the
     #: original; "-" when the original is already small; "" not made yet.
     thumb = models.CharField(max_length=300, blank=True, default="")
+    #: The small WebP itself, served at /api/v1/img/<token>.webp. Kept here,
+    #: not on Backblaze, so serving pictures never touches Backblaze's caps.
+    small = models.BinaryField(null=True, blank=True, editable=False)
+    token = models.CharField(max_length=32, unique=True, null=True, blank=True)
+    #: The stored value the code was made from (to undo an echoed-back URL).
+    source = models.CharField(max_length=1000, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

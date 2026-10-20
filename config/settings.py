@@ -106,6 +106,8 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     # Records the acting user on history rows (for models using --history).
     "simple_history.middleware.HistoryRequestMiddleware",
+    # Lets picture URLs point back at this API (apps/core/blurhash.py).
+    "apps.core.blurhash.RequestBaseMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -517,6 +519,9 @@ SMS_DAILY_CAP_PER_STORE = int(os.getenv("SMS_DAILY_CAP_PER_STORE", "300"))
 
 # Blurhash previews (apps/core/blurhash.py): hash pictures that have no code
 # yet in a background thread the first time they are served. Off in tests.
+#: Optional: this API's public address for picture URLs (else taken from each
+#: request, e.g. https://coop-api.clinixa.cloud).
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")
 BLURHASH_BACKGROUND = env_bool("BLURHASH_BACKGROUND", "test" not in sys.argv)
 #: Where the customer app lives; the link in the SMS points here.
 CUSTOMER_APP_PATH = os.getenv("CUSTOMER_APP_PATH", "/app")
