@@ -218,25 +218,28 @@ def thumb_bytes(data: bytes) -> bytes | None:
 
 # ---------------------------------------------------------------------------
 # In-memory table, refreshed from the database every few minutes.
-# identity -> (blurhash, token)   (the image bytes are never held in memory)
+# identity -> (blurhash, token, legacy)   (the image bytes are never held in memory)
+# `legacy` is a small copy made by the first version, on Backblaze ("b2://thumbs/…"):
+# served until the picture is redone into the database, because browsers
+# already hold it under that very link (the signed link is reused for a day).
 
 _lock = threading.Lock()
-_memo: dict[str, tuple[str, str]] = {}
-_loaded_at = 0.0
+_memo: dict[str, tuple[str, str, str]] = {}
+_loaded_at: float | None = None  # None = never loaded (monotonic() can be < _RELOAD right after boot)
 _RELOAD = 300
 
 
 def _ensure_loaded():
     global _loaded_at
     now = time.monotonic()
-    if now - _loaded_at < _RELOAD:
+    if _loaded_at is not None and now - _loaded_at < _RELOAD:
         return
     _loaded_at = now  # set first: a failing database is not retried per call
     try:
         from apps.core.models import ImageHash
 
         rows = {
-            k: (h, tok if t == IN_DB and tok else "")
+            k: (h, tok if t == IN_DB and tok else "", t if t.startswith("b2://") else "")
             for k, h, t, tok in ImageHash.objects.values_list("key", "blurhash", "thumb", "token")
         }
         with _lock:
@@ -245,7 +248,7 @@ def _ensure_loaded():
         log.info("blurhash: could not load codes (%s)", type(exc).__name__)
 
 
-def entry(value) -> tuple[str, str] | None:
+def entry(value) -> tuple[str, str, str] | None:
     key = identity(value)
     if not key:
         return None
@@ -276,7 +279,8 @@ def remember(value, code: str | None, small: bytes | None = None) -> None:
         log.info("blurhash: could not save code (%s)", type(exc).__name__)
         return
     with _lock:
-        _memo[key] = (code, token)
+        old = _memo.get(key)
+        _memo[key] = (code, token, "" if token else (old[2] if old else ""))
 
 
 def reset_memory():
@@ -284,7 +288,7 @@ def reset_memory():
     global _loaded_at
     with _lock:
         _memo.clear()
-    _loaded_at = 0.0
+    _loaded_at = None
     _pending.clear()
 
 
@@ -338,11 +342,14 @@ def with_hash(url, stored=None):
             enqueue(stored or url)
         if not e:
             return url
-        code, token = e
-        if token:
-            mine = image_url(token)
-            if mine:
-                url = mine
+        code, token, legacy = e
+        mine = image_url(token) if token else ""
+        if mine:
+            url = mine
+        elif legacy:
+            from apps.core.uploads import _resolve
+
+            url = _resolve(legacy) or url
         return f"{url}{_FRAG}{quote(code, safe='')}" if code else url
     except Exception:  # noqa: BLE001
         return url
@@ -380,7 +387,7 @@ def fetch_bytes(value: str) -> bytes | None:
             with default_storage.open(rel) as f:
                 return f.read(MAX_BYTES)
     except Exception as exc:  # noqa: BLE001
-        log.info("blurhash: could not fetch image (%s)", type(exc).__name__)
+        log.info("blurhash: could not fetch image (%s: %s)", type(exc).__name__, str(exc)[:200])
     return None
 
 
@@ -464,6 +471,8 @@ _fields_cache: dict[type, tuple[str, ...]] = {}
 
 
 def picture_fields(model) -> tuple[str, ...]:
+    if model._meta.label == "core.ImageHash":
+        return ()  # our own table: its "thumb" column is not a picture field
     if model not in _fields_cache:
         from django.db import models as m
 

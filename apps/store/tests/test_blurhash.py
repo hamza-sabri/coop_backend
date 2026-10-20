@@ -200,3 +200,26 @@ class SmallCopies(TestCase):
         p.save()
         p.refresh_from_db()
         self.assertEqual(p.image, "b2://products/" + "c" * 32 + ".jpg")
+
+
+class PictureFields(TestCase):
+    def test_the_hash_table_itself_is_not_scanned(self):
+        self.assertEqual(blurhash.picture_fields(ImageHash), ())
+        self.assertIn("image", blurhash.picture_fields(models.Product))
+
+
+class LegacyCopies(TestCase):
+    """Rows from the first version keep serving their Backblaze copy (which
+    browsers already hold) until they are redone into the database."""
+
+    def setUp(self):
+        blurhash.reset_memory()
+
+    def test_b2_copy_is_served_until_redone(self):
+        url = "https://cdn.example.com/legacy.jpg"
+        ImageHash.objects.create(key=blurhash.identity(url), blurhash="LKO2?U%2Tw=w]~RBVZRi};RPxuwH",
+                                 thumb="b2://thumbs/" + "e" * 32 + ".webp")
+        with mock.patch("apps.core.uploads._resolve", return_value="https://b2.example/thumbs/eee.webp?sig=1"), \
+                override_settings(BLURHASH_BACKGROUND=False):
+            served = blurhash.with_hash(url)
+        self.assertTrue(served.startswith("https://b2.example/thumbs/eee.webp?sig=1#bh="), served)
