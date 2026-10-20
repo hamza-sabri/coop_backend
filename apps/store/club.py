@@ -22,7 +22,7 @@ def normalise_phone(raw: str) -> str:
     d = re.sub(r"\D", "", raw or "")
     for cc in ("00970", "00972", "970", "972"):
         if d.startswith(cc) and len(d) > len(cc) + 7:
-            d = "0" + d[len(cc):]
+            d = "0" + d[len(cc):].lstrip("0")
             break
     if d and not d.startswith("0") and len(d) == 9:
         d = "0" + d

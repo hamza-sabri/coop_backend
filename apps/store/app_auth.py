@@ -106,7 +106,9 @@ class SmsLimited(exceptions.APIException):
 
 def _check_limits(store: models.Store, phone: str, request=None) -> None:
     now = timezone.now()
-    logs = models.SmsLog.objects.unscoped()
+    # A message the provider refused cost nothing and reached nobody: it must
+    # not lock the customer out of trying again.
+    logs = models.SmsLog.objects.unscoped().exclude(status=models.SmsLog.Status.FAILED)
     last = logs.filter(phone=phone).order_by("-created_at").values_list("created_at", flat=True).first()
     if last and now - last < PHONE_COOLDOWN:
         wait = int((PHONE_COOLDOWN - (now - last)).total_seconds()) + 1

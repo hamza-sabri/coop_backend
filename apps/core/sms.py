@@ -58,7 +58,17 @@ def send(local_phone: str, msg: str) -> SmsResult:
         return SmsResult(False, False, "Invalid TO Parameters (local check)")
     api_id = (getattr(settings, "HTD_SMS_API_ID", "") or "").strip()
     sender = getattr(settings, "HTD_SMS_SENDER", "COOP")
-    return send_as(to, msg, sender=sender, api_id=api_id)
+    res = send_as(to, msg, sender=sender, api_id=api_id)
+    # Palestinian numbers are reachable as 970… and, on some routes, 972….
+    # If the provider refuses one form, try the other once (a refused
+    # message is not billed).
+    if not res.ok and not res.dry_run and not res.response.startswith("error:"):
+        alt = ("972" if to.startswith("970") else "970") + to[3:]
+        log.info("sms retry with other country code (%s…)", alt[:6])
+        res2 = send_as(alt, msg, sender=sender, api_id=api_id)
+        if res2.ok:
+            return res2
+    return res
 
 
 def send_as(to: str, msg: str, *, sender: str, api_id: str) -> SmsResult:
@@ -67,24 +77,19 @@ def send_as(to: str, msg: str, *, sender: str, api_id: str) -> SmsResult:
         return SmsResult(True, True, "dry_run")
     import requests
 
+    # The plain HTTP API (manual §1) — the same call HTD's own panel shows:
+    # SendSMS.aspx?id=…&sender=…&to=…&msg=…  (requests URL-encodes msg).
     try:
-        resp = requests.post(
-            getattr(settings, "HTD_SMS_URL", "https://sms.htd.ps/API/SendJSON.aspx"),
-            data={"id": api_id, "sender": sender, "to": to, "msg": msg, "mode": "0"},
+        resp = requests.get(
+            getattr(settings, "HTD_SMS_URL", "https://sms.htd.ps/API/SendSMS.aspx"),
+            params={"id": api_id, "sender": sender, "to": to, "msg": msg, "mode": "0"},
             timeout=15,
         )
         text = (resp.text or "").strip()
     except Exception as exc:  # network down, DNS, timeout
         log.warning("sms send failed: %s", exc)
         return SmsResult(False, False, f"error: {type(exc).__name__}")
-    status = text
-    try:
-        body = resp.json()
-        if isinstance(body, dict):
-            status = str(body.get("STATUS") or body.get("status") or text)
-    except ValueError:
-        pass
-    ok = "sent successfully" in status.lower()
+    ok = "sent successfully" in text.lower() or text.upper().startswith("OK")
     if not ok:
-        log.warning("sms rejected by provider: %s", status[:200])
-    return SmsResult(ok, False, status[:255])
+        log.warning("sms rejected by provider: %s (to=%s… sender=%s len=%s)", text[:200], to[:6], sender, len(msg))
+    return SmsResult(ok, False, text[:255])

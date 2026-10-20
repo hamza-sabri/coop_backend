@@ -68,6 +68,10 @@ class ClerkAuthentication(authentication.BaseAuthentication):
         # plainly a Firebase one, this authenticator has nothing to say.
         if getattr(request, "firebase_uid", None):
             return None
+        # Same for the phone sign-in session (apps/store/app_auth.py): an
+        # opaque "cs_" token Clerk cannot read, already accepted upstream.
+        if getattr(request, "app_customer_id", None) or token.startswith("cs_"):
+            return None
         try:
             from apps.accounts.firebase import looks_like_firebase
 

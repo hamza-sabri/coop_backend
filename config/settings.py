@@ -510,7 +510,7 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "")
 # nothing is sent; codes are logged as "dry_run" so the flow can be tested.
 HTD_SMS_API_ID = os.getenv("HTD_SMS_API_ID", "")
 HTD_SMS_SENDER = os.getenv("HTD_SMS_SENDER", "COOP")
-HTD_SMS_URL = os.getenv("HTD_SMS_URL", "https://sms.htd.ps/API/SendJSON.aspx")
+HTD_SMS_URL = os.getenv("HTD_SMS_URL", "https://sms.htd.ps/API/SendSMS.aspx")
 SMS_DRY_RUN = env_bool("SMS_DRY_RUN", not bool(HTD_SMS_API_ID))
 #: Hard ceiling per store per day — a bug or an attack cannot empty the balance.
 SMS_DAILY_CAP_PER_STORE = int(os.getenv("SMS_DAILY_CAP_PER_STORE", "300"))

@@ -352,3 +352,54 @@ class OneSmsOnly(Base):
             self.assertLessEqual(len(msg), 70, msg)
             self.assertEqual(sms.segments(msg), 1, msg)
         self.assertEqual(set(models.SmsLog.objects.unscoped().values_list("segments", flat=True)), {1})
+
+
+class ProductionQuirks(Base):
+    def test_session_works_with_clerk_switched_on(self):
+        # Production still has the old Clerk sign-in enabled. It must leave the
+        # phone session's "cs_" token alone instead of rejecting it (401).
+        self.otp()
+        token = self.verify().json()["token"]
+        with mock.patch("apps.accounts.clerk._clerk_enabled", return_value=True):
+            r = self.as_customer(token).get("/api/v1/shop/me/")
+        self.assertEqual(r.status_code, 200, r.content)
+
+    @override_settings(HTD_SMS_API_ID="k", SMS_DRY_RUN=False)
+    def test_real_send_uses_the_http_api_and_reads_its_answer(self):
+        class R:
+            def __init__(self, text):
+                self.text = text
+
+        with mock.patch("requests.get", return_value=R("Message Sent Successfully")) as g:
+            res = sms.send_as("970599123456", "hi", sender="COOP", api_id="k")
+        self.assertTrue(res.ok)
+        self.assertIn("SendSMS.aspx", g.call_args.args[0])
+        self.assertEqual(g.call_args.kwargs["params"]["to"], "970599123456")
+        with mock.patch("requests.get", return_value=R("E150|Error Occurred!")):
+            self.assertFalse(sms.send_as("970599123456", "hi", sender="COOP", api_id="k").ok)
+
+    @override_settings(HTD_SMS_API_ID="k", SMS_DRY_RUN=False)
+    def test_a_refused_sms_does_not_block_a_retry(self):
+        class R:
+            text = "E150|Error Occurred!"
+
+        with mock.patch("requests.get", return_value=R()):
+            self.assertEqual(self.otp().status_code, 502)
+            self.assertEqual(self.otp().status_code, 502)  # not 429
+
+    @override_settings(HTD_SMS_API_ID="k", SMS_DRY_RUN=False)
+    def test_refused_970_is_retried_as_972(self):
+        class R:
+            def __init__(self, text):
+                self.text = text
+
+        answers = [R("E150|Error Occurred!"), R("Message Sent Successfully")]
+        with mock.patch("requests.get", side_effect=answers) as g:
+            res = sms.send("0597968056", "hi")
+        self.assertTrue(res.ok)
+        tos = [c.kwargs["params"]["to"] for c in g.call_args_list]
+        self.assertEqual(tos, ["970597968056", "972597968056"])
+
+    def test_country_code_typed_with_the_leading_zero(self):
+        for raw in ("9720597968056", "+970 0597968056", "972597968056", "00970597968056"):
+            self.assertEqual(app_auth.clean_phone(raw), "0597968056", raw)
