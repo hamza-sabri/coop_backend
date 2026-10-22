@@ -254,7 +254,7 @@ def notify_staff_new_order(order) -> None:
     if not webpush.configured():
         return
 
-    def _deliver():
+    def _deliver(reminder: int = 0):
         from apps.store.models import StaffPushSubscription
 
         try:
@@ -270,7 +270,7 @@ def notify_staff_new_order(order) -> None:
             what = "، ".join(f"{int(it.quantity)}× {it.name}" for it in items[:4])
             where = f"طاولة {order.table_number}" if order.fulfilment == "dinein" and order.table_number else "استلام"
             message = {
-                "title": f"🔔 طلب جديد #{order.pk}",
+                "title": f"⏰ طلب #{order.pk} لسا ما انقبل" if reminder else f"🔔 طلب جديد #{order.pk}",
                 "body": " · ".join(x for x in (getattr(order.customer, "name", "") or "", where, what) if x),
                 "tag": f"staff-order-{order.pk}",
                 "url": "/live",
@@ -304,12 +304,45 @@ def notify_staff_new_order(order) -> None:
                     _deliver()
                 finally:
                     close_old_connections()
+                remind_until_accepted(order.pk, _deliver, tidy=close_old_connections)
 
             threading.Thread(target=run, name="staff-push", daemon=True).start()
         else:
             _deliver()
 
     transaction.on_commit(_later)
+
+
+#: A locked iPhone dings ONCE per web push and a website cannot loop a sound,
+#: so an order nobody has accepted is pushed again every STAFF_REMIND_SECONDS,
+#: at most STAFF_REMIND_TIMES times (30s × 10 = five minutes), stopping the
+#: moment its status leaves «بانتظار التأكيد».
+def remind_until_accepted(order_pk: int, deliver, sleep=None, tidy=None) -> int:
+    """`tidy` runs after each check (the worker thread passes
+    close_old_connections, so no DB connection idles through the waits)."""
+    import time
+
+    from apps.store.models import Order
+
+    sleep = sleep or time.sleep
+    every = float(getattr(settings, "STAFF_REMIND_SECONDS", 30))
+    times = int(getattr(settings, "STAFF_REMIND_TIMES", 10))
+    sent = 0
+    for n in range(1, times + 1):
+        sleep(every)
+        try:
+            status = Order.objects.unscoped().filter(pk=order_pk).values_list("status", flat=True).first()
+            if status != Order.Status.PLACED:
+                break
+            deliver(reminder=n)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001 — a reminder must never crash the worker
+            log.warning("staff push reminder: order %s: %s", order_pk, exc)
+            break
+        finally:
+            if tidy:
+                tidy()
+    return sent
 
 
 def _push_fcm(store, customer, title: str, body: str, data: dict) -> int:

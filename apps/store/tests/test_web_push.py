@@ -225,6 +225,43 @@ class StaffPush(Base):
         self.assertEqual(msg["url"], "/live")
 
 
+    def test_reminders_repeat_until_the_order_is_accepted(self):
+        from apps.store import push
+
+        p = models.Product.objects.create(store=self.a, name="لاتيه", price=12)
+        self.otp()
+        cust = self.as_customer(self.verify().json()["token"])
+        o = cust.post("/api/v1/shop/orders/", {"items": [{"product": p.id, "quantity": 1}],
+                                                "client_uuid": "55555555-5555-5555-5555-555555555555"},
+                      format="json").json()
+        calls, naps = [], []
+
+        def deliver(reminder=0):
+            calls.append(reminder)
+            if reminder == 2:  # someone accepts it after the 2nd reminder
+                self.staff.post(f"/api/v1/orders/{o['id']}/advance/", {"status": "accepted"}, format="json")
+
+        with override_settings(STAFF_REMIND_SECONDS=30, STAFF_REMIND_TIMES=10):
+            n = push.remind_until_accepted(o["id"], deliver, sleep=naps.append)
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(n, 2)
+        self.assertEqual(naps, [30, 30, 30])
+
+    def test_reminders_stop_after_the_limit(self):
+        from apps.store import push
+
+        p = models.Product.objects.create(store=self.a, name="لاتيه", price=12)
+        self.otp()
+        cust = self.as_customer(self.verify().json()["token"])
+        o = cust.post("/api/v1/shop/orders/", {"items": [{"product": p.id, "quantity": 1}],
+                                                "client_uuid": "66666666-6666-6666-6666-666666666666"},
+                      format="json").json()
+        calls = []
+        with override_settings(STAFF_REMIND_TIMES=3):
+            push.remind_until_accepted(o["id"], lambda reminder=0: calls.append(reminder), sleep=lambda s: None)
+        self.assertEqual(calls, [1, 2, 3])
+
+
 class NativeAppPush(Base):
     """The Flutter app (FCM): the shop's sound rides on every message."""
 
