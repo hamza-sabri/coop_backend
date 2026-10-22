@@ -523,6 +523,12 @@ SMS_DAILY_CAP_PER_STORE = int(os.getenv("SMS_DAILY_CAP_PER_STORE", "300"))
 #: request, e.g. https://coop-api.clinixa.cloud).
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")
 
+# App Store / Google Play review sign-in: this number signs in with this code
+# (no SMS sent). Set both in the deployment only while a review is open, e.g.
+# APP_REVIEW_PHONE=0590000000  APP_REVIEW_CODE=<6 digits>. Unset = off.
+APP_REVIEW_PHONE = os.getenv("APP_REVIEW_PHONE", "")
+APP_REVIEW_CODE = os.getenv("APP_REVIEW_CODE", "")
+
 # Web Push for the customer app (apps/store/webpush.py). One key pair for the
 # whole platform: `python manage.py make_vapid_keys`, then paste both into the
 # deployment's environment. Unset = no push (the in-app feed still works).

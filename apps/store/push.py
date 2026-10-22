@@ -125,7 +125,7 @@ def _access_token() -> str | None:
         return None
 
 
-def _send_one(token: str, title: str, body: str, data: dict) -> str:
+def _send_one(token: str, title: str, body: str, data: dict, sound: str = "coop") -> str:
     """Deliver to one device. Returns 'ok', 'gone', or 'error'.
 
     'gone' is the important one: FCM reports an unregistered or invalid token
@@ -144,21 +144,27 @@ def _send_one(token: str, title: str, body: str, data: dict) -> str:
     # in it is rejected wholesale with a 400 that does not say which key.
     flat = {str(k): ("" if v is None else str(v)) for k, v in (data or {}).items()}
 
+    # The shop's own sound (Store.app_settings["sound"]). The app ships the
+    # files and one Android channel per sound ("koup_<sound>"), because on
+    # Android 8+ the sound belongs to the channel, not to the message.
+    aps = {"badge": 1}
+    if sound != "off":
+        aps["sound"] = f"{sound}.caf"
     message = {
         "message": {
             "token": token,
             "notification": {"title": title, "body": body or ""},
-            "data": flat,
+            "data": {**flat, "sound": sound},
             "android": {
                 "priority": "high",
                 "notification": {
-                    "channel_id": "koup_orders",
-                    "sound": "default",
+                    "channel_id": f"koup_{sound}",
+                    **({"sound": sound} if sound != "off" else {}),
                 },
             },
             "apns": {
                 "headers": {"apns-priority": "10"},
-                "payload": {"aps": {"sound": "default", "badge": 1}},
+                "payload": {"aps": aps},
             },
         }
     }
@@ -321,8 +327,9 @@ def _push_fcm(store, customer, title: str, body: str, data: dict) -> int:
         return 0
 
     sent, dead = 0, []
+    sound = app_sound(store)
     for row_id, token in tokens:
-        outcome = _send_one(token, title, body, data)
+        outcome = _send_one(token, title, body, data, sound)
         if outcome == "ok":
             sent += 1
         elif outcome == "gone":

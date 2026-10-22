@@ -209,3 +209,25 @@ class StaffPush(Base):
         self.assertIn("2× لاتيه", msg["body"])
         self.assertTrue(msg["requireInteraction"])
         self.assertEqual(msg["url"], "/live")
+
+
+class NativeAppPush(Base):
+    """The Flutter app (FCM): the shop's sound rides on every message."""
+
+    @override_settings(FIREBASE_PROJECT_ID="p")
+    def test_fcm_message_uses_the_shops_sound_channel(self):
+        from apps.store import push
+
+        sent = []
+        with mock.patch.object(push, "_access_token", return_value="tok"), \
+                mock.patch("requests.post", side_effect=lambda url, headers=None, json=None, timeout=None:
+                           sent.append(json) or mock.Mock(status_code=200, text="")):
+            self.assertEqual(push._send_one("t", "طلبك جاهز", "", {"order_id": 3}, "bell"), "ok")
+            push._send_one("t", "x", "", {}, "off")
+        m = sent[0]["message"]
+        self.assertEqual(m["android"]["notification"]["channel_id"], "koup_bell")
+        self.assertEqual(m["apns"]["payload"]["aps"]["sound"], "bell.caf")
+        self.assertEqual(m["data"]["sound"], "bell")
+        off = sent[1]["message"]
+        self.assertEqual(off["android"]["notification"]["channel_id"], "koup_off")
+        self.assertNotIn("sound", off["apns"]["payload"]["aps"])

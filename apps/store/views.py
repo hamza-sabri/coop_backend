@@ -4710,6 +4710,52 @@ class ShopMeView(APIView):
         return Response({"profile": club.profile(customer)})
 
 
+class ShopAccountDeleteView(APIView):
+    """POST /shop/me/delete/ {confirm: true} — the customer deletes their account.
+
+    Required by both app stores, and the right thing to offer anyway. The
+    person is erased — name, phone, email, photo, birthday, sign-in links,
+    sessions, devices, notifications — but the shop's books are not: their
+    past invoices and orders stay, attached to an anonymous row, so the day's
+    takings and the stock never change because someone left.
+    """
+
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    @transaction.atomic
+    def post(self, request):
+        if request.data.get("confirm") not in (True, "true", "1", 1):
+            return Response({"detail": "أكّد حذف الحساب"}, status=400)
+        ident = identity_filter(request)
+        store = app_store(request)
+        if not ident or store is None:
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
+        customer = models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+        if customer is None:
+            return Response({"ok": True})
+        now = timezone.now()
+        models.CustomerSession.objects.unscoped().filter(customer=customer, revoked_at__isnull=True).update(revoked_at=now)
+        models.DeviceToken.objects.unscoped().filter(customer=customer).delete()
+        models.PushSubscription.objects.unscoped().filter(customer=customer).delete()
+        models.Notification.objects.unscoped().filter(customer=customer).delete()
+        customer.name = "زبون محذوف"
+        customer.phone = None
+        customer.email = ""
+        customer.avatar = ""
+        customer.birth_date = None
+        customer.clerk_id = ""
+        customer.firebase_uid = ""
+        customer.notes = ""
+        customer.app_registered_at = None
+        customer.save()
+        invalidate_customers_quick_cache(store.pk)
+        import logging
+
+        logging.getLogger(__name__).info("customer %s deleted their app account (store %s)", customer.pk, store.pk)
+        return Response({"ok": True})
+
+
 class ShopOrdersView(APIView):
     """The customer's own orders — place one, and see the ones before it.
 

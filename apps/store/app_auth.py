@@ -364,6 +364,15 @@ class OtpRequestView(_Public):
         phone = clean_phone(request.data.get("phone"))
         if not phone:
             return Response({"detail": "رقم جوال غير صحيح — مثال: 0599123456"}, status=400)
+        review_phone = clean_phone(getattr(settings, "APP_REVIEW_PHONE", "") or "")
+        review_code = str(getattr(settings, "APP_REVIEW_CODE", "") or "").strip()
+        if review_phone and review_code.isdigit() and phone == review_phone:
+            # The App Store / Play review account: a fixed number whose code
+            # is set in the deployment (no SMS is sent, no limits apply), so a
+            # reviewer can sign in without a Palestinian SIM.
+            with transaction.atomic():
+                _new_code(store, phone, models.CustomerAuthCode.Kind.OTP, review_code, OTP_TTL)
+            return Response({"sent": True, "expires_in": int(OTP_TTL.total_seconds())})
         _check_limits(store, phone, request)
         code = _digits()
         with transaction.atomic():
