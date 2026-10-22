@@ -145,6 +145,20 @@ class WebPush(Base):
 
 
 @override_settings(WEBPUSH_PUBLIC_KEY="", WEBPUSH_PRIVATE_KEY="")
+class KeyPasting(Base):
+    """Keys pasted into the host's env with quotes, spaces or a wrong public
+    half still give browsers the RIGHT key (derived from the private one)."""
+
+    def test_quotes_spaces_and_a_wrong_public_key_are_survived(self):
+        other_pub, _ = webpush.make_keys()
+        with override_settings(WEBPUSH_PUBLIC_KEY=f'"{other_pub}"', WEBPUSH_PRIVATE_KEY=f' "{PRIV}"\n'):
+            self.assertTrue(webpush.configured())
+            self.assertEqual(webpush.public_key(), PUB)
+        with override_settings(WEBPUSH_PUBLIC_KEY=f"'{PUB}'", WEBPUSH_PRIVATE_KEY="not-a-key"):
+            self.assertFalse(webpush.configured())
+
+
+@override_settings(WEBPUSH_PUBLIC_KEY="", WEBPUSH_PRIVATE_KEY="")
 class WithoutKeys(Base):
     def test_nothing_is_sent_and_nothing_breaks(self):
         c = models.Customer.objects.create(store=self.a, name="س", phone="0599000009")

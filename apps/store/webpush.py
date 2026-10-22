@@ -36,17 +36,38 @@ def b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
+def _clean(text) -> str:
+    """An env value as pasted: drop spaces, newlines and wrapping quotes."""
+    return "".join((text or "").split()).strip("\"'")
+
+
 def unb64u(text: str) -> bytes:
-    text = (text or "").strip()
+    text = _clean(text)
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
 def public_key() -> str:
-    return (getattr(settings, "WEBPUSH_PUBLIC_KEY", "") or "").strip()
+    """The key browsers subscribe with. Derived from the PRIVATE key whenever
+    that one is usable, so a mis-pasted / swapped / stale WEBPUSH_PUBLIC_KEY
+    can never make every subscription fail."""
+    try:
+        if _clean(getattr(settings, "WEBPUSH_PRIVATE_KEY", "")):
+            from cryptography.hazmat.primitives import serialization
+
+            pub = _private_key().public_key().public_bytes(
+                serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+            )
+            return b64u(pub)
+    except Exception:  # noqa: BLE001 — a broken private key: fall back, and say so
+        log.warning("WEBPUSH_PRIVATE_KEY is not a valid P-256 key")
+    return _clean(getattr(settings, "WEBPUSH_PUBLIC_KEY", ""))
 
 
 def configured() -> bool:
-    return bool(public_key() and (getattr(settings, "WEBPUSH_PRIVATE_KEY", "") or "").strip())
+    try:
+        return bool(_clean(getattr(settings, "WEBPUSH_PRIVATE_KEY", "")) and public_key() and _private_key())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def make_keys() -> tuple[str, str]:
