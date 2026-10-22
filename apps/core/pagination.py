@@ -30,3 +30,23 @@ class StandardPagination(PageNumberPagination):
                 "results": data,
             }
         )
+
+
+class OwnerCountPagination(StandardPagination):
+    """The same envelope, but how many rows the whole shop has is the owner's.
+
+    An employee scrolling the invoice list gets `next` (all infinite scroll
+    needs) and no `count`/`total_pages` — otherwise the shop's invoice count
+    for the day is one request away. A list narrowed to one customer keeps its
+    count: that is the customer's visits, which the counter needs to page.
+    """
+
+    def get_paginated_response(self, data):
+        resp = super().get_paginated_response(data)
+        req = self.request
+        from apps.store.cafe_api import _is_owner
+
+        if not _is_owner(getattr(req, "user", None)) and not req.query_params.get("customer"):
+            resp.data["count"] = None
+            resp.data["total_pages"] = None
+        return resp

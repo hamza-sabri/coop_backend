@@ -522,6 +522,15 @@ SMS_DAILY_CAP_PER_STORE = int(os.getenv("SMS_DAILY_CAP_PER_STORE", "300"))
 #: Optional: this API's public address for picture URLs (else taken from each
 #: request, e.g. https://coop-api.clinixa.cloud).
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")
+
+# Web Push for the customer app (apps/store/webpush.py). One key pair for the
+# whole platform: `python manage.py make_vapid_keys`, then paste both into the
+# deployment's environment. Unset = no push (the in-app feed still works).
+WEBPUSH_PUBLIC_KEY = os.getenv("WEBPUSH_PUBLIC_KEY", "")
+WEBPUSH_PRIVATE_KEY = os.getenv("WEBPUSH_PRIVATE_KEY", "")
+WEBPUSH_SUBJECT = os.getenv("WEBPUSH_SUBJECT", "mailto:admin@sijilli.app")
+#: Deliver pushes on a background thread (off the request). Off under tests.
+PUSH_BACKGROUND = env_bool("PUSH_BACKGROUND", "test" not in sys.argv)
 BLURHASH_BACKGROUND = env_bool("BLURHASH_BACKGROUND", "test" not in sys.argv)
 #: Where the customer app lives; the link in the SMS points here.
 CUSTOMER_APP_PATH = os.getenv("CUSTOMER_APP_PATH", "/app")

@@ -1566,7 +1566,7 @@ class PublicMenuView(APIView):
             return Response({"detail": "غير موجود."}, status=404)
         store_id, _enabled = hit
 
-        key = f"store:{store_id}:public_menu:v1"
+        key = f"store:{store_id}:public_menu:v2"
         payload = cache.get(key)
         if payload is None:
             rows = (
@@ -1584,6 +1584,17 @@ class PublicMenuView(APIView):
             )
             price_by_med = {r["id"]: r["price"] for r in rows}
             variants = PublicPriceCheckView._public_variants(store_id, price_by_med)
+            # The extra pictures (up to five per drink), in their order — one
+            # query for the whole menu.
+            gallery: dict[int, list[str]] = {}
+            for pid_, img in (
+                models.ProductImage.objects.for_pharmacy(store_id)
+                .filter(product_id__in=list(price_by_med))
+                .order_by("product_id", "position", "id")
+                .values_list("product_id", "image")
+            ):
+                if img:
+                    gallery.setdefault(pid_, []).append(img)
             items = [
                 {
                     "id": r["id"],
@@ -1596,6 +1607,7 @@ class PublicMenuView(APIView):
                     "category": r["category__name"] or "",
                     "category_icon": r["category__icon"] or "",
                     "variants": variants.get(r["id"], []),
+                    "images": gallery.get(r["id"], []),
                 }
                 for r in rows
             ]
@@ -3068,6 +3080,9 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     Deleting a sale restores stock and removes its linked (unpaid) debt.
     """
 
+    from apps.core.pagination import OwnerCountPagination as _OwnerCount
+
+    pagination_class = _OwnerCount
     # unscoped() base: StoreScopedMixin re-filters by tenant every request.
     queryset = (
         models.Sale.objects.unscoped()
@@ -3696,17 +3711,20 @@ class SaleViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         from apps.store.cafe_api import _is_owner
 
         qs = self.filter_queryset(self.get_queryset())
+        # How many invoices, like how much they took, is the owner's figure:
+        # an employee's device is never sent either.
+        if not _is_owner(request.user):
+            return Response({})
         out = {"count": qs.count()}
-        if _is_owner(request.user):
-            money = DecimalField(max_digits=18, decimal_places=2)
-            signed = Case(When(is_return=True, then=-F("discounted_total")), default=F("discounted_total"), output_field=money)
-            total = qs.aggregate(n=Coalesce(Sum(signed, output_field=money), Decimal("0.00"), output_field=money))["n"]
-            back = (
-                models.SaleReturn.objects.for_pharmacy(self.store_id)
-                .filter(sale__in=qs.values("pk"))
-                .aggregate(n=Coalesce(Sum("refund_amount"), Decimal("0.00"), output_field=money))["n"]
-            )
-            out["total"] = str((total - back).quantize(Decimal("0.01")))
+        money = DecimalField(max_digits=18, decimal_places=2)
+        signed = Case(When(is_return=True, then=-F("discounted_total")), default=F("discounted_total"), output_field=money)
+        total = qs.aggregate(n=Coalesce(Sum(signed, output_field=money), Decimal("0.00"), output_field=money))["n"]
+        back = (
+            models.SaleReturn.objects.for_pharmacy(self.store_id)
+            .filter(sale__in=qs.values("pk"))
+            .aggregate(n=Coalesce(Sum("refund_amount"), Decimal("0.00"), output_field=money))["n"]
+        )
+        out["total"] = str((total - back).quantize(Decimal("0.01")))
         return Response(out)
 
     @action(detail=False, methods=["get"])
@@ -4300,6 +4318,33 @@ class QuickGroupsView(APIView):
         return Response({"groups": clean})
 
 
+class AppSettingsView(APIView):
+    """The customer app's settings for the requester's shop.
+
+    GET /api/v1/store/app-settings/        -> {"sound": "coop", "sounds": [...]}
+    PUT /api/v1/store/app-settings/ {sound} (owner only)
+    """
+
+    permission_classes = [permissions.IsAuthenticated, StoreResolved]
+
+    def get(self, request):
+        store = models.Store.objects.get(pk=request_pharmacy_id(request))
+        return Response({"sound": push_service.app_sound(store), "sounds": list(push_service.APP_SOUNDS)})
+
+    def put(self, request):
+        from apps.store.cafe_api import _is_owner
+
+        if not _is_owner(request.user):
+            return Response({"detail": "للمالك فقط"}, status=403)
+        store = models.Store.objects.get(pk=request_pharmacy_id(request))
+        sound = (request.data.get("sound") or "").strip()
+        if sound not in push_service.APP_SOUNDS:
+            return Response({"sound": "صوت غير معروف"}, status=400)
+        store.app_settings = {**(store.app_settings or {}), "sound": sound}
+        store.save(update_fields=["app_settings"])
+        return Response({"sound": sound, "sounds": list(push_service.APP_SOUNDS)})
+
+
 class PharmacyBrandingView(APIView):
     """Owner-only branding for the requester's store — logo + display name.
 
@@ -4839,6 +4884,64 @@ class ShopDeviceView(APIView):
         return Response({"ok": True})
 
 
+class ShopWebPushView(APIView):
+    """/shop/push/ — this browser wants (or no longer wants) order updates.
+
+    GET    → {"key": <VAPID public key>, "enabled": bool, "sound": <shop's sound>}
+             (the key is public by design; it is what the browser subscribes with)
+    POST   {endpoint, keys: {p256dh, auth}} → subscribe this signed-in customer
+    DELETE {endpoint} → stop
+
+    Per shop: the same browser following two shops keeps both.
+    """
+
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+
+    def _customer(self, request):
+        ident = identity_filter(request)
+        store = app_store(request)
+        if not ident or store is None:
+            return store, None
+        return store, models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+
+    def get(self, request):
+        from apps.store import webpush
+
+        store, _ = self._customer(request)
+        return Response({
+            "key": webpush.public_key() if webpush.configured() else "",
+            "enabled": webpush.configured(),
+            "sound": push_service.app_sound(store) if store is not None else "coop",
+        })
+
+    def post(self, request):
+        store, customer = self._customer(request)
+        if customer is None:
+            return Response({"detail": "سجّل دخولك للمتابعة"}, status=401)
+        endpoint = (request.data.get("endpoint") or "").strip()
+        keys = request.data.get("keys") or {}
+        p256dh = (keys.get("p256dh") or "").strip()
+        auth = (keys.get("auth") or "").strip()
+        if not endpoint.startswith("https://") or not p256dh or not auth or len(endpoint) > 2000:
+            return Response({"detail": "اشتراك غير صالح"}, status=400)
+        models.PushSubscription.objects.unscoped().update_or_create(
+            store=store, endpoint=endpoint,
+            defaults={
+                "customer": customer, "p256dh": p256dh[:255], "auth": auth[:255],
+                "user_agent": (request.META.get("HTTP_USER_AGENT") or "")[:255],
+            },
+        )
+        return Response({"ok": True})
+
+    def delete(self, request):
+        store, customer = self._customer(request)
+        endpoint = (request.data.get("endpoint") or "").strip()
+        if store is not None and endpoint:
+            models.PushSubscription.objects.for_pharmacy(store.pk).filter(endpoint=endpoint).delete()
+        return Response({"ok": True})
+
+
 class ShopOrderCancelView(APIView):
     """POST /shop/orders/<pk>/cancel/ — the customer changed their mind.
 
@@ -4999,6 +5102,31 @@ class ShopNotificationsView(APIView):
         return Response({"ok": True})
 
 
+class OrderFilter(django_filters.FilterSet):
+    """The order history: by status, customer and fulfilment, and by business
+    day (?day_from=&day_to=, the 4am cutover — same as the invoice list)."""
+
+    day_from = django_filters.DateFilter(method="filter_day_from")
+    day_to = django_filters.DateFilter(method="filter_day_to")
+    customer = django_filters.NumberFilter(field_name="customer_id")
+
+    class Meta:
+        model = models.Order
+        fields = ["status", "fulfilment"]
+
+    def filter_day_from(self, queryset, name, value):
+        from apps.store import finance
+
+        lo, _ = finance.bounds(value, value)
+        return queryset.filter(created_at__gte=lo)
+
+    def filter_day_to(self, queryset, name, value):
+        from apps.store import finance
+
+        _, hi = finance.bounds(value, value)
+        return queryset.filter(created_at__lt=hi)
+
+
 class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     """Staff side: the counter's queue.
 
@@ -5020,7 +5148,7 @@ class OrderViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     # ?customer= is what a customer profile needs; ?status= is what the queue
     # needs. Without a filter backend both were silently ignored and every
     # caller got the whole store's orders.
-    filterset_fields = ["status", "customer", "fulfilment"]
+    filterset_class = OrderFilter
     # Searching a reverse relation multiplies rows; distinct() in the queryset
     # keeps one card per order.
     search_fields = ["customer__name", "items__name"]

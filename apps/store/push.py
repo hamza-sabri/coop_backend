@@ -187,8 +187,59 @@ def _send_one(token: str, title: str, body: str, data: dict) -> str:
     return "error"
 
 
+#: The sounds a shop can give its customer app (frontend: public/sounds/<name>.wav).
+APP_SOUNDS = ("coop", "chime", "bell", "off")
+
+
+def app_sound(store) -> str:
+    s = ((getattr(store, "app_settings", None) or {}).get("sound") or "coop")
+    return s if s in APP_SOUNDS else "coop"
+
+
 def push_to_customer(store, customer, title: str, body: str, data: dict) -> int:
-    """Fan out to every device this customer has. Returns how many succeeded."""
+    """Fan out to every device this customer has (installed apps through FCM,
+    browsers through Web Push). Returns how many succeeded."""
+    return _push_fcm(store, customer, title, body, data) + _push_web(store, customer, title, body, data)
+
+
+def _push_web(store, customer, title: str, body: str, data: dict) -> int:
+    from apps.store import webpush
+    from apps.store.models import PushSubscription
+
+    if not webpush.configured():
+        return 0
+    subs = list(PushSubscription.objects.for_pharmacy(store.pk).filter(customer=customer))
+    if not subs:
+        return 0
+    order_id = (data or {}).get("order_id")
+    message = {
+        "title": title,
+        "body": body or "",
+        # A newer status of the same order replaces the older one on the lock screen.
+        "tag": f"order-{order_id}" if order_id else (data or {}).get("kind", "note"),
+        "sound": app_sound(store),
+        "store": store.slug,
+        "url": f"/app?store={store.slug}" + (f"#order={order_id}" if order_id else ""),
+        "data": {k: v for k, v in (data or {}).items() if isinstance(v, (str, int, float, bool)) or v is None},
+    }
+    sent, dead = 0, []
+    for sub in subs:
+        outcome = webpush.send(sub, message)
+        if outcome == "ok":
+            sent += 1
+        elif outcome == "gone":
+            dead.append(sub.pk)
+    if sent:
+        PushSubscription.objects.unscoped().filter(pk__in=[s.pk for s in subs if s.pk not in dead]).update(
+            last_used_at=timezone.now()
+        )
+    if dead:
+        PushSubscription.objects.unscoped().filter(pk__in=dead).delete()
+        log.info("webpush: pruned %d dead subscription(s)", len(dead))
+    return sent
+
+
+def _push_fcm(store, customer, title: str, body: str, data: dict) -> int:
     from apps.store.models import DeviceToken
 
     if not (getattr(settings, "FIREBASE_CREDENTIALS", "") or ""):
@@ -251,7 +302,23 @@ def notify(store, customer, kind: str, title: str, body: str = "", data: dict | 
             # A failed push is not a failed order. Log and move on.
             log.warning("push: delivery failed for notification %s: %s", note.pk, exc)
 
-    transaction.on_commit(_deliver)
+    def _later():
+        # Off the request: a slow push service must never hold up the
+        # barista's screen. Tests (and PUSH_BACKGROUND=0) deliver inline.
+        if getattr(settings, "PUSH_BACKGROUND", True):
+            threading.Thread(target=_in_thread, name="push", daemon=True).start()
+        else:
+            _deliver()
+
+    def _in_thread():
+        from django.db import close_old_connections
+
+        try:
+            _deliver()
+        finally:
+            close_old_connections()
+
+    transaction.on_commit(_later)
     return note
 
 
@@ -272,7 +339,15 @@ ORDER_MESSAGES = {
 
 
 def notify_order_status(order):
-    """Tell the customer their order moved. Safe to call on every transition."""
+    """Tell the customer their order moved. Safe to call on every transition.
+
+    Also the one place every move passes through (placing, the counter's
+    advance, the customer's cancel), so it is where the move is written into
+    the order's own timeline."""
+    try:
+        order.record_step()
+    except Exception as exc:  # noqa: BLE001 — a timeline must never block an order
+        log.warning("order %s: timeline not recorded: %s", order.pk, exc)
     entry = ORDER_MESSAGES.get(order.status)
     if not entry:
         return None

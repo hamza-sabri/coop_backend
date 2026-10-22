@@ -236,7 +236,8 @@ class ProductSerializer(OwnerOnlyFieldsMixin, ImageUploadMixin, serializers.Mode
     `category` / `manufacturer` read and write as plain name strings.
     """
 
-    MAX_GALLERY = 8
+    #: Up to five extra pictures beside the main one.
+    MAX_GALLERY = 5
     owner_only_fields = ("cost",)
     owner_write_fields = ("price",)
 
@@ -1794,7 +1795,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "fulfilment", "table_number", "beans_spent",
             "beans_value", "cash_total",
             "cancelled_reason", "client_uuid", "items",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "timeline",
         ]
         read_only_fields = [
             # `customer` is READ-ONLY, and that is a security property, not a
@@ -1806,8 +1807,21 @@ class OrderSerializer(serializers.ModelSerializer):
             # send and must never be trusted with one.
             "id", "status_label", "next_statuses", "total", "customer",
             "customer_name", "created_at", "updated_at", "beans_spent",
-            "beans_value", "cash_total",
+            "beans_value", "cash_total", "timeline",
         ]
+
+    timeline = serializers.SerializerMethodField()
+
+    def get_timeline(self, obj) -> list:
+        """The recorded steps; for an order from before they were recorded,
+        what is known for sure: when it was placed, and its status now."""
+        steps = list(getattr(obj, "timeline", None) or [])
+        if steps:
+            return steps
+        out = [{"s": "placed", "at": obj.created_at.isoformat() if obj.created_at else None}]
+        if obj.status != "placed":
+            out.append({"s": obj.status, "at": obj.updated_at.isoformat() if obj.updated_at else None})
+        return out
 
     def get_next_statuses(self, obj) -> list:
         return list(models.Order.TRANSITIONS.get(obj.status, ()))

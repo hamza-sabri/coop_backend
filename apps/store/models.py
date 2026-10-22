@@ -109,6 +109,10 @@ class Store(TimeStampedModel):
     #: Empty by default. Every shop builds its own — a default list would be a
     #: guess about a trade we know nothing about.
     pos_quick_groups = models.JSONField(default=list, blank=True)
+    #: The customer app's per-shop choices, e.g. {"sound": "coop"} — the sound
+    #: its customers hear when their order moves. A bag, not columns, so a
+    #: new app setting is not a migration.
+    app_settings = models.JSONField(default=dict, blank=True)
     #: How many loyalty points make one shekel (10 → a point is 10 agorot).
     #: Null = the deployment default (settings.POINTS_PER_ILS). Changing it
     #: changes what balances are WORTH from now on; every past redemption
@@ -1525,9 +1529,26 @@ class Order(TimeStampedModel):
     client_uuid = models.CharField(
         max_length=64, null=True, blank=True, default=None, db_index=True
     )
+    #: Every status the order has been in, with when: [{"s": "ready", "at":
+    #: iso}, …]. It is what the customer's order page draws as its timeline,
+    #: and it lives on the row (not in a joined table) so the order list stays
+    #: one query however long the shop's history gets.
+    timeline = models.JSONField(default=list, blank=True)
 
     objects = TenantManager()
     unguarded = models.Manager()
+
+    def record_step(self, at=None) -> None:
+        """Append the current status to the timeline and save just that."""
+        from django.utils import timezone as _tz
+
+        at = at or _tz.now()
+        steps = list(self.timeline or [])
+        if steps and steps[-1].get("s") == self.status:
+            return
+        steps.append({"s": self.status, "at": at.isoformat()})
+        self.timeline = steps[-40:]
+        type(self).objects.unscoped().filter(pk=self.pk).update(timeline=self.timeline)
 
     class Meta:
         ordering = ["-created_at"]
@@ -1665,9 +1686,9 @@ class PushSubscription(TimeStampedModel):
     customer = models.ForeignKey(
         Customer, related_name="push_subscriptions", on_delete=models.CASCADE
     )
-    #: The URL the push service gave us. Unique across the table — the same
-    #: browser re-subscribing must update, not duplicate.
-    endpoint = models.TextField(unique=True)
+    #: The URL the push service gave us. Unique per shop — the same browser
+    #: re-subscribing must update, not duplicate.
+    endpoint = models.TextField()
     p256dh = models.CharField(max_length=255)
     auth = models.CharField(max_length=255)
     user_agent = models.CharField(max_length=255, blank=True)
@@ -1680,6 +1701,11 @@ class PushSubscription(TimeStampedModel):
         ordering = ["-created_at"]
         base_manager_name = "unguarded"
         default_manager_name = "unguarded"
+        constraints = [
+            # One browser can follow several shops (same site, same push
+            # endpoint): one row per shop, so following one never unfollows another.
+            models.UniqueConstraint(fields=["store", "endpoint"], name="uniq_push_store_endpoint"),
+        ]
 
     def __str__(self):
         return f"{self.customer_id} · {self.endpoint[:40]}…"

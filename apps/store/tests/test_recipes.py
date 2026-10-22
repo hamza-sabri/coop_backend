@@ -432,7 +432,7 @@ class ExpenseKindTests(RecipeBase):
 
 
 class SalesSummaryTests(RecipeBase):
-    def test_summary_counts_the_filtered_list_and_hides_money_from_staff(self):
+    def test_summary_counts_the_filtered_list_and_hides_count_and_money_from_staff(self):
         self.sell(1)
         self.sell(2)
         day = finance.today().isoformat()
@@ -442,8 +442,15 @@ class SalesSummaryTests(RecipeBase):
         self.assertEqual(d["total"], "36.00")
         s = self.staff.get(f"/api/v1/sales/summary/?day_from={day}&day_to={day}").json()
         s = s.get("data", s)
-        self.assertEqual(s["count"], 2)
+        self.assertNotIn("count", s)
         self.assertNotIn("total", s)
+        # Nor is the invoice list's own count sent to an employee …
+        lst = self.staff.get(f"/api/v1/sales/?day_from={day}&day_to={day}").json()
+        lst = lst.get("data", lst)
+        self.assertIsNone(lst["count"])
+        self.assertEqual(len(lst["results"]), 2)
+        own = self.api.get(f"/api/v1/sales/?day_from={day}&day_to={day}").json()
+        self.assertEqual(own.get("data", own)["count"], 2)
         # yesterday is empty
         y = (finance.today() - __import__("datetime").timedelta(days=1)).isoformat()
         r = self.api.get(f"/api/v1/sales/summary/?day_from={y}&day_to={y}").json()

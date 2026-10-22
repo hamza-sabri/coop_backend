@@ -32,6 +32,7 @@ urlpatterns = router.urls + [
     # Same contract as clerk/sync/, for the native app. Called once per
     # sign-in so the Customer row exists before the first /shop/me/.
     path("firebase/sync/", FirebaseSyncView.as_view(), name="firebase-sync"),
+    path("store/app-settings/", views.AppSettingsView.as_view(), name="store-app-settings"),
     path(
         "store/quick-groups/",
         views.QuickGroupsView.as_view(),
@@ -69,6 +70,7 @@ urlpatterns = router.urls + [
     ),
     # This phone can receive push. Re-called on every launch: FCM tokens rotate.
     path("shop/devices/", views.ShopDeviceView.as_view(), name="shop-devices"),
+    path("shop/push/", views.ShopWebPushView.as_view(), name="shop-web-push"),
     # One-tap reorder of what they always get.
     path("shop/usual/", views.ShopUsualView.as_view(), name="shop-usual"),
     # The durable half of notifications — works when push does not.
