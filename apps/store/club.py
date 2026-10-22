@@ -7,7 +7,7 @@ web door that gets customers signed in and tells the shop who they are.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from django.db import transaction
 from django.db.models import Sum
@@ -41,6 +41,73 @@ def profile(c: models.Customer) -> dict:
         "avatar": resolve_stored_url(c.avatar),
         "member_since": c.created_at.date().isoformat(),
         "complete": bool(c.phone and c.gender_set),
+    }
+
+
+def stats(store, c: models.Customer) -> dict:
+    """The customer's own numbers for their account dashboard: how often they
+    come, what they spend, what they have most — over ALL their visits, not
+    just the last page of `purchases`."""
+    from django.db.models import Count
+    from django.db.models.functions import ExtractHour, TruncMonth
+    from django.utils import timezone
+
+    sales = models.Sale.objects.for_pharmacy(store.pk).filter(customer=c, is_return=False)
+    agg = sales.aggregate(n=Count("id"), spent=Sum("discounted_total"))
+    visits = agg["n"] or 0
+    spent = agg["spent"] or 0
+    first = sales.order_by("created_at").values_list("created_at", flat=True).first()
+    last = sales.order_by("-created_at").values_list("created_at", flat=True).first()
+
+    items = models.SaleItem.objects.for_pharmacy(store.pk).filter(sale__in=sales)
+    top = list(
+        items.exclude(medication_name="").values("medication_name")
+        .annotate(q=Sum("quantity")).order_by("-q", "medication_name")[:3]
+    )
+    cats = list(
+        items.exclude(category="").values("category")
+        .annotate(q=Sum("quantity")).order_by("-q", "category")[:3]
+    )
+
+    tz = timezone.get_current_timezone()
+    now = timezone.localtime()
+    start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=150)).replace(day=1)
+    by_month = {
+        r["m"].date().isoformat()[:7]: r
+        for r in sales.filter(created_at__gte=start)
+        .annotate(m=TruncMonth("created_at", tzinfo=tz)).values("m")
+        .annotate(n=Count("id"), s=Sum("discounted_total"))
+    }
+    months, y, m = [], start.year, start.month
+    for _ in range(6):
+        key = f"{y:04d}-{m:02d}"
+        r = by_month.get(key)
+        months.append({"month": key, "visits": r["n"] if r else 0, "spent": str(r["s"] or 0) if r else "0"})
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+    hour = (
+        sales.annotate(h=ExtractHour("created_at", tzinfo=tz)).values("h")
+        .annotate(n=Count("id")).order_by("-n", "h").values_list("h", flat=True).first()
+    )
+    orders = models.Order.objects.for_pharmacy(store.pk).filter(customer=c).exclude(status="cancelled").count()
+
+    def qty(v):
+        v = v or 0
+        return int(v) if v == int(v) else float(v)
+
+    return {
+        "visits": visits,
+        "spent": str(spent),
+        "avg_bill": str(round(spent / visits, 2)) if visits else "0",
+        "first_visit": timezone.localtime(first).isoformat() if first else None,
+        "last_visit": timezone.localtime(last).isoformat() if last else None,
+        "top_items": [{"name": r["medication_name"], "qty": qty(r["q"])} for r in top],
+        "top_categories": [{"name": r["category"], "qty": qty(r["q"])} for r in cats],
+        "months": months,
+        "usual_hour": hour,
+        "app_orders": orders,
     }
 
 

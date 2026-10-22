@@ -4677,6 +4677,7 @@ class ShopMeView(APIView):
             "name": customer.name,
             "profile": club.profile(customer),
             "purchases": club.purchases(store, customer),
+            "stats": club.stats(store, customer),
             "beans": beans,
             "tier": getattr(profile, "tier", "single"),
             "multiplier": str(getattr(profile, "multiplier", 1)),
