@@ -202,6 +202,12 @@ def app_sound(store) -> str:
     return s if s in APP_SOUNDS else "coop"
 
 
+def app_pour(store) -> bool:
+    """Does the customer app play the cup-pouring animation on launch? On
+    unless the owner switched it off (each customer can also turn it off)."""
+    return (getattr(store, "app_settings", None) or {}).get("pour", True) is not False
+
+
 def push_to_customer(store, customer, title: str, body: str, data: dict) -> int:
     """Fan out to every device this customer has (installed apps through FCM,
     browsers through Web Push). Returns how many succeeded."""

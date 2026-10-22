@@ -143,6 +143,17 @@ class WebPush(Base):
         emp.force_authenticate(User.objects.create_user("emp", password="x", store=self.a, role="employee"))
         self.assertEqual(emp.put("/api/v1/store/app-settings/", {"sound": "chime"}, format="json").status_code, 403)
 
+    def test_owner_turns_the_pour_off_for_everyone(self):
+        api = self.signed_in()
+        self.assertTrue(api.get("/api/v1/shop/me/").json()["app"]["pour"])
+        r = self.staff.put("/api/v1/store/app-settings/", {"pour": False}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(r.json()["pour"])
+        self.assertEqual(r.json()["sound"], "coop")  # untouched
+        me = api.get("/api/v1/shop/me/").json()
+        self.assertEqual(me["app"], {"sound": "coop", "pour": False})
+        self.assertEqual(self.staff.put("/api/v1/store/app-settings/", {"pour": "no"}, format="json").status_code, 400)
+
 
 @override_settings(WEBPUSH_PUBLIC_KEY="", WEBPUSH_PRIVATE_KEY="")
 class KeyPasting(Base):

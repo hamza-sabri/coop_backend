@@ -4321,15 +4321,20 @@ class QuickGroupsView(APIView):
 class AppSettingsView(APIView):
     """The customer app's settings for the requester's shop.
 
-    GET /api/v1/store/app-settings/        -> {"sound": "coop", "sounds": [...]}
-    PUT /api/v1/store/app-settings/ {sound} (owner only)
+    GET /api/v1/store/app-settings/        -> {"sound": "coop", "pour": true, "sounds": [...]}
+    PUT /api/v1/store/app-settings/ {sound?, pour?} (owner only; either or both)
     """
 
     permission_classes = [permissions.IsAuthenticated, StoreResolved]
 
+    @staticmethod
+    def _body(store):
+        return {"sound": push_service.app_sound(store), "pour": push_service.app_pour(store),
+                "sounds": list(push_service.APP_SOUNDS)}
+
     def get(self, request):
         store = models.Store.objects.get(pk=request_pharmacy_id(request))
-        return Response({"sound": push_service.app_sound(store), "sounds": list(push_service.APP_SOUNDS)})
+        return Response(self._body(store))
 
     def put(self, request):
         from apps.store.cafe_api import _is_owner
@@ -4337,12 +4342,22 @@ class AppSettingsView(APIView):
         if not _is_owner(request.user):
             return Response({"detail": "للمالك فقط"}, status=403)
         store = models.Store.objects.get(pk=request_pharmacy_id(request))
-        sound = (request.data.get("sound") or "").strip()
-        if sound not in push_service.APP_SOUNDS:
-            return Response({"sound": "صوت غير معروف"}, status=400)
-        store.app_settings = {**(store.app_settings or {}), "sound": sound}
+        changes = {}
+        if "sound" in request.data:
+            sound = (request.data.get("sound") or "").strip()
+            if sound not in push_service.APP_SOUNDS:
+                return Response({"sound": "صوت غير معروف"}, status=400)
+            changes["sound"] = sound
+        if "pour" in request.data:
+            pour = request.data.get("pour")
+            if not isinstance(pour, bool):
+                return Response({"pour": "true أو false"}, status=400)
+            changes["pour"] = pour
+        if not changes:
+            return Response({"detail": "لا يوجد تغيير"}, status=400)
+        store.app_settings = {**(store.app_settings or {}), **changes}
         store.save(update_fields=["app_settings"])
-        return Response({"sound": sound, "sounds": list(push_service.APP_SOUNDS)})
+        return Response(self._body(store))
 
 
 class PharmacyBrandingView(APIView):
@@ -4674,6 +4689,9 @@ class ShopMeView(APIView):
             # The whole scheme, sent to the phone rather than hard-coded in it:
             # the balance's worth in shekels, and the two rates behind it. When
             # the shop changes the rate, the app changes with it.
+            # The shop's app switches: its notification sound and whether
+            # the cup pours on launch (the owner can turn that off for all).
+            "app": {"sound": push_service.app_sound(store), "pour": push_service.app_pour(store)},
             "value_ils": str(points_service.value_of(beans, store)),
             "points_per_ils": points_service.per_ils(store),
             "earn_rate": str(points_service.EARN_RATE),
