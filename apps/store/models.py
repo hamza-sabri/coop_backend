@@ -1711,6 +1711,42 @@ class PushSubscription(TimeStampedModel):
         return f"{self.customer_id} · {self.endpoint[:40]}…"
 
 
+class StaffPushSubscription(TimeStampedModel):
+    """One staff browser that wants "new order" on its lock screen.
+
+    For the counter's employees: a phone in a pocket, or the admin closed —
+    the browser's push service delivers it anyway (Web Push, same VAPID keys
+    as the customer app). One row per shop and browser; the user is kept so
+    a sign-out, or an account that stops being an employee, can be cut off.
+    """
+
+    store = models.ForeignKey(
+        Store, related_name="staff_push_subscriptions", on_delete=models.CASCADE
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name="push_subscriptions", on_delete=models.CASCADE
+    )
+    endpoint = models.TextField()
+    p256dh = models.CharField(max_length=255)
+    auth = models.CharField(max_length=255)
+    user_agent = models.CharField(max_length=255, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    objects = TenantManager()
+    unguarded = models.Manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        base_manager_name = "unguarded"
+        default_manager_name = "unguarded"
+        constraints = [
+            models.UniqueConstraint(fields=["store", "endpoint"], name="uniq_staff_push_store_endpoint"),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} · {self.endpoint[:40]}…"
+
+
 class DeviceToken(TimeStampedModel):
     """One installed app's FCM registration token.
 

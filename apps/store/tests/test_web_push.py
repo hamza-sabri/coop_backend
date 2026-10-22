@@ -154,3 +154,58 @@ class WithoutKeys(Base):
         with mock.patch("requests.post") as post, self.captureOnCommitCallbacks(execute=True):
             self.assertIsNotNone(push.notify(self.a, c, "order_ready", "x"))
         post.assert_not_called()
+
+
+@override_settings(WEBPUSH_PUBLIC_KEY=PUB, WEBPUSH_PRIVATE_KEY=PRIV, ONLINE_ORDERS_ENABLED=True)
+class StaffPush(Base):
+    """A new order buzzes the EMPLOYEES' phones (admin closed, phone locked);
+    owners and superusers are never alerted."""
+
+    def staff_api(self, user):
+        from rest_framework.test import APIClient
+
+        api = APIClient()
+        api.force_authenticate(user)
+        return api
+
+    def sub(self, api, endpoint):
+        key, p256dh, auth = browser()
+        return api.post("/api/v1/store/staff-push/", {"endpoint": endpoint, "keys": {"p256dh": p256dh, "auth": webpush.b64u(auth)}},
+                        format="json"), key, auth
+
+    def test_only_employees_subscribe_and_get_new_orders(self):
+        from apps.accounts.models import User
+
+        emp = User.objects.create_user("emp1", password="x", store=self.a, role="employee")
+        other_shop_emp = User.objects.create_user("emp2", password="x", store=self.b, role="employee")
+        body = self.staff.get("/api/v1/store/staff-push/").json()
+        self.assertFalse(body.get("data", body)["eligible"])  # owner
+        r, _, _ = self.sub(self.staff, "https://push.example.com/owner")
+        self.assertEqual(r.status_code, 403)
+        r, key, auth = self.sub(self.staff_api(emp), "https://push.example.com/emp")
+        self.assertEqual(r.status_code, 200, r.content)
+        r, _, _ = self.sub(self.staff_api(other_shop_emp), "https://push.example.com/other")
+        self.assertEqual(r.status_code, 200)
+
+        self.otp()
+        cust = self.as_customer(self.verify().json()["token"])
+        p = models.Product.objects.create(store=self.a, name="لاتيه", price=12)
+        sent = []
+
+        def fake_post(url, data=None, headers=None, timeout=None):
+            sent.append((url, data))
+            return mock.Mock(status_code=201, text="")
+
+        with mock.patch("requests.post", side_effect=fake_post), self.captureOnCommitCallbacks(execute=True):
+            o = cust.post("/api/v1/shop/orders/", {"items": [{"product": p.id, "quantity": 2}], "fulfilment": "dinein",
+                                                    "table_number": "4", "client_uuid": "44444444-4444-4444-4444-444444444444"},
+                          format="json").json()
+        staff_sent = [d for u, d in sent if u == "https://push.example.com/emp"]
+        self.assertEqual(len(staff_sent), 1)
+        self.assertFalse(any(u == "https://push.example.com/other" for u, _ in sent))
+        msg = decrypt(staff_sent[0], key, auth)
+        self.assertEqual(msg["title"], f"🔔 طلب جديد #{o['id']}")
+        self.assertIn("طاولة 4", msg["body"])
+        self.assertIn("2× لاتيه", msg["body"])
+        self.assertTrue(msg["requireInteraction"])
+        self.assertEqual(msg["url"], "/live")

@@ -4824,6 +4824,7 @@ class ShopOrdersView(APIView):
                 )
 
         push_service.notify_order_status(order)
+        push_service.notify_staff_new_order(order)
         return Response(serializers.OrderSerializer(order).data, status=201)
 
 
@@ -4939,6 +4940,57 @@ class ShopWebPushView(APIView):
         endpoint = (request.data.get("endpoint") or "").strip()
         if store is not None and endpoint:
             models.PushSubscription.objects.for_pharmacy(store.pk).filter(endpoint=endpoint).delete()
+        return Response({"ok": True})
+
+
+class StaffWebPushView(APIView):
+    """/store/staff-push/ — this staff browser wants "new order" on its lock screen.
+
+    GET    → {"key", "enabled", "eligible"}  (eligible: employees only — owners
+             and superusers are not alerted)
+    POST   {endpoint, keys: {p256dh, auth}} → subscribe
+    DELETE {endpoint} → stop
+    """
+
+    permission_classes = [permissions.IsAuthenticated, StoreResolved]
+
+    @staticmethod
+    def _eligible(user) -> bool:
+        return bool(user and user.is_authenticated and not getattr(user, "is_owner", True))
+
+    def get(self, request):
+        from apps.store import webpush
+
+        return Response({
+            "key": webpush.public_key() if webpush.configured() else "",
+            "enabled": webpush.configured(),
+            "eligible": self._eligible(request.user),
+        })
+
+    def post(self, request):
+        if not self._eligible(request.user):
+            return Response({"detail": "تنبيهات الطلبات للموظفين فقط"}, status=403)
+        endpoint = (request.data.get("endpoint") or "").strip()
+        keys = request.data.get("keys") or {}
+        p256dh = (keys.get("p256dh") or "").strip()
+        auth = (keys.get("auth") or "").strip()
+        if not endpoint.startswith("https://") or not p256dh or not auth or len(endpoint) > 2000:
+            return Response({"detail": "اشتراك غير صالح"}, status=400)
+        models.StaffPushSubscription.objects.unscoped().update_or_create(
+            store_id=request_pharmacy_id(request), endpoint=endpoint,
+            defaults={
+                "user": request.user, "p256dh": p256dh[:255], "auth": auth[:255],
+                "user_agent": (request.META.get("HTTP_USER_AGENT") or "")[:255],
+            },
+        )
+        return Response({"ok": True})
+
+    def delete(self, request):
+        endpoint = (request.data.get("endpoint") or "").strip()
+        if endpoint:
+            models.StaffPushSubscription.objects.for_pharmacy(request_pharmacy_id(request)).filter(
+                endpoint=endpoint
+            ).delete()
         return Response({"ok": True})
 
 

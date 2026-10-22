@@ -239,6 +239,73 @@ def _push_web(store, customer, title: str, body: str, data: dict) -> int:
     return sent
 
 
+def notify_staff_new_order(order) -> None:
+    """A customer just ordered: tell the counter's EMPLOYEES' phones, even
+    with the admin closed or the phone locked (Web Push). Owners and platform
+    superusers are not alerted. After commit, off the request; never raises."""
+    from apps.store import webpush
+
+    if not webpush.configured():
+        return
+
+    def _deliver():
+        from apps.store.models import StaffPushSubscription
+
+        try:
+            subs = list(
+                StaffPushSubscription.objects.for_pharmacy(order.store_id)
+                .select_related("user")
+                .filter(user__is_active=True, user__is_superuser=False, user__role="employee",
+                        user__store_id=order.store_id)
+            )
+            if not subs:
+                return
+            items = list(order.items.all())
+            what = "، ".join(f"{int(it.quantity)}× {it.name}" for it in items[:4])
+            where = f"طاولة {order.table_number}" if order.fulfilment == "dinein" and order.table_number else "استلام"
+            message = {
+                "title": f"🔔 طلب جديد #{order.pk}",
+                "body": " · ".join(x for x in (getattr(order.customer, "name", "") or "", where, what) if x),
+                "tag": f"staff-order-{order.pk}",
+                "url": "/live",
+                # Stays on screen until someone acts on it; buzzes long.
+                "requireInteraction": True,
+                "vibrate": [500, 200, 500, 200, 800],
+                "data": {"order_id": order.pk, "kind": "staff_new_order"},
+            }
+            sent, dead = 0, []
+            for sub in subs:
+                outcome = webpush.send(sub, message, ttl=600)
+                if outcome == "ok":
+                    sent += 1
+                elif outcome == "gone":
+                    dead.append(sub.pk)
+            if dead:
+                StaffPushSubscription.objects.unscoped().filter(pk__in=dead).delete()
+            if sent:
+                StaffPushSubscription.objects.unscoped().filter(
+                    pk__in=[x.pk for x in subs if x.pk not in dead]
+                ).update(last_used_at=timezone.now())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("staff push: order %s: %s", order.pk, exc)
+
+    def _later():
+        if getattr(settings, "PUSH_BACKGROUND", True):
+            def run():
+                from django.db import close_old_connections
+
+                try:
+                    _deliver()
+                finally:
+                    close_old_connections()
+
+            threading.Thread(target=run, name="staff-push", daemon=True).start()
+        else:
+            _deliver()
+
+    transaction.on_commit(_later)
+
+
 def _push_fcm(store, customer, title: str, body: str, data: dict) -> int:
     from apps.store.models import DeviceToken
 

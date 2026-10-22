@@ -71,6 +71,7 @@ urlpatterns = router.urls + [
     # This phone can receive push. Re-called on every launch: FCM tokens rotate.
     path("shop/devices/", views.ShopDeviceView.as_view(), name="shop-devices"),
     path("shop/push/", views.ShopWebPushView.as_view(), name="shop-web-push"),
+    path("store/staff-push/", views.StaffWebPushView.as_view(), name="staff-web-push"),
     # One-tap reorder of what they always get.
     path("shop/usual/", views.ShopUsualView.as_view(), name="shop-usual"),
     # The durable half of notifications — works when push does not.
