@@ -12,7 +12,7 @@ from django.db.models import (
 )
 from django.db.models.functions import Coalesce, TruncDate, TruncMonth
 from django.utils import timezone
-from rest_framework import filters, permissions, viewsets
+from rest_framework import filters, parsers, permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -4726,6 +4726,73 @@ class ShopMeView(APIView):
             return Response({"detail": e.msg, "field": e.field}, status=e.status)
         invalidate_customers_quick_cache(store.pk)
         return Response({"profile": club.profile(customer)})
+
+
+class ShopAvatarView(APIView):
+    """The customer's own photo, from the app.
+
+    POST /shop/me/avatar/  multipart `file` → {"avatar": url}
+    DELETE /shop/me/avatar/                 → {"avatar": ""}
+
+    The picture is re-drawn here rather than stored as sent: turned upright
+    (phones save sideways with an EXIF flag), cropped square from the centre,
+    scaled to 512px and saved as JPEG. That also strips the EXIF block — which
+    can carry where the photo was taken — before it is stored anywhere.
+    """
+
+    authentication_classes = [CustomerSessionAuthentication, FirebaseAuthentication, ClerkAuthentication]
+    permission_classes = [IsAppCustomer]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
+
+    MAX_BYTES = 12 * 1024 * 1024
+    SIZE = 512
+
+    def _customer(self, request):
+        ident = identity_filter(request)
+        store = app_store(request)
+        if not ident or store is None:
+            return store, None
+        return store, models.Customer.objects.for_pharmacy(store.pk).filter(**ident).first()
+
+    def post(self, request):
+        import io
+
+        from django.core.files.base import ContentFile
+        from PIL import Image, ImageOps, UnidentifiedImageError
+
+        from apps.core.uploads import resolve_stored_url, store_upload
+
+        store, customer = self._customer(request)
+        if customer is None:
+            return Response({"detail": "سجّل دخولك من جديد."}, status=409)
+        f = request.FILES.get("file")
+        if f is None:
+            return Response({"detail": "اختر صورة."}, status=400)
+        if f.size > self.MAX_BYTES:
+            return Response({"detail": "الصورة كبيرة — اختر صورة أصغر."}, status=400)
+        try:
+            img = Image.open(f)
+            img.load()
+        except (UnidentifiedImageError, OSError, ValueError):
+            return Response({"detail": "هذا الملف مش صورة."}, status=400)
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img = ImageOps.fit(img, (self.SIZE, self.SIZE), method=Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=86, optimize=True)
+        url = store_upload(ContentFile(out.getvalue(), name="avatar.jpg"), "avatars", request=request)
+        customer.avatar = url
+        customer.save(update_fields=["avatar", "updated_at"])
+        invalidate_customers_quick_cache(store.pk)
+        return Response({"avatar": resolve_stored_url(url)})
+
+    def delete(self, request):
+        store, customer = self._customer(request)
+        if customer is None:
+            return Response({"detail": "سجّل دخولك من جديد."}, status=409)
+        customer.avatar = ""
+        customer.save(update_fields=["avatar", "updated_at"])
+        invalidate_customers_quick_cache(store.pk)
+        return Response({"avatar": ""})
 
 
 class ShopAccountDeleteView(APIView):

@@ -62,6 +62,7 @@ urlpatterns = router.urls + [
     path("shop/auth/logout/", app_auth.LogoutView.as_view(), name="shop-logout"),
     path("shop/me/", views.ShopMeView.as_view(), name="shop-me"),
     path("shop/me/delete/", views.ShopAccountDeleteView.as_view(), name="shop-me-delete"),
+    path("shop/me/avatar/", views.ShopAvatarView.as_view(), name="shop-me-avatar"),
     # The customer places orders here and reads their own history back.
     path("shop/orders/", views.ShopOrdersView.as_view(), name="shop-orders"),
     path(
