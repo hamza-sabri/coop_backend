@@ -48,6 +48,7 @@ urlpatterns = router.urls + [
     ),
     path("public/stats/", views.PublicStatsView.as_view(), name="public-stats"),
     # The customer app reads its menu here — see PublicMenuView.
+    path("public/app-config/", views.PublicAppConfigView.as_view(), name="public-app-config"),
     path("public/menu/", views.PublicMenuView.as_view(), name="public-menu"),
     path("public/ordering/", views.PublicOrderingView.as_view(), name="public-ordering"),
     # The signed-in customer's own points, tier and history. Clerk-authed —

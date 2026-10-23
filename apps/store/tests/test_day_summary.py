@@ -133,7 +133,11 @@ class DaySummaryTests(APITestCase):
         start = datetime.fromisoformat(data["day_start"])
         end = datetime.fromisoformat(data["day_end"])
         self.assertEqual(start.hour, 4)
-        self.assertEqual((end - start), timedelta(days=1))
+        # The next day at the same wall-clock hour. Not "exactly 24 hours":
+        # on the night the clocks change the business day is 23 or 25 hours
+        # long, and that is correct.
+        self.assertEqual(end.date() - start.date(), timedelta(days=1))
+        self.assertEqual(end.hour, start.hour)
         self.assertEqual(data["cutover_hour"], 4)
 
     @override_settings(BUSINESS_DAY_START_HOUR=6)

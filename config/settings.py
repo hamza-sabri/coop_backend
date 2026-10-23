@@ -527,6 +527,22 @@ PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "")
 # (no SMS sent). Set both in the deployment only while a review is open, e.g.
 # APP_REVIEW_PHONE=0590000000  APP_REVIEW_CODE=<6 digits>. Unset = off.
 APP_REVIEW_PHONE = os.getenv("APP_REVIEW_PHONE", "")
+# The phone app's remote settings (/public/app-config/). The app compares its
+# own BUILD number (the +N in pubspec's version) with these:
+#   APP_MIN_BUILD    below this the app shows "update to continue" (blocking)
+#   APP_LATEST_BUILD below this it shows a gentle "a new version is out"
+# APP_IOS_URL / APP_ANDROID_URL are the store pages (also used by /app on the
+# web). APP_API_BASE, when set, moves installed apps to a new API address on
+# their next launch — set it BEFORE an old API domain is retired.
+APP_MIN_BUILD = int(os.getenv("APP_MIN_BUILD", "0") or 0)
+APP_LATEST_BUILD = int(os.getenv("APP_LATEST_BUILD", "0") or 0)
+APP_IOS_URL = os.getenv("APP_IOS_URL", "")
+APP_ANDROID_URL = os.getenv(
+    "APP_ANDROID_URL", "https://play.google.com/store/apps/details?id=cloud.clinixa.koup"
+)
+APP_API_BASE = os.getenv("APP_API_BASE", "")
+# Hosts APP_API_BASE may point at (a typo here must never strand every phone).
+APP_API_HOSTS = [h.strip() for h in os.getenv("APP_API_HOSTS", "clinixa.cloud,sijiliati.com").split(",") if h.strip()]
 APP_REVIEW_CODE = os.getenv("APP_REVIEW_CODE", "")
 
 # Web Push for the customer app (apps/store/webpush.py). One key pair for the

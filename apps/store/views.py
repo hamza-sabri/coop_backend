@@ -1530,6 +1530,35 @@ class PublicOrderingView(APIView):
         return Response({"open": bool(store) and online_orders_open(store)})
 
 
+class PublicAppConfigView(APIView):
+    """GET /public/app-config/ — what the installed phone app needs to know
+    before anything else: is this build still allowed, is there a newer one,
+    where are the stores, and (when an API domain is being retired) which
+    address to use from now on. Public and tiny; the app calls it at launch.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        from urllib.parse import urlsplit
+
+        base = (getattr(settings, "APP_API_BASE", "") or "").strip().rstrip("/")
+        if base:
+            parts = urlsplit(base)
+            allowed = getattr(settings, "APP_API_HOSTS", [])
+            host_ok = any(parts.hostname == h or (parts.hostname or "").endswith("." + h) for h in allowed)
+            if parts.scheme != "https" or not host_ok:
+                base = ""
+        return Response({
+            "min_build": int(getattr(settings, "APP_MIN_BUILD", 0) or 0),
+            "latest_build": int(getattr(settings, "APP_LATEST_BUILD", 0) or 0),
+            "ios_url": getattr(settings, "APP_IOS_URL", "") or "",
+            "android_url": getattr(settings, "APP_ANDROID_URL", "") or "",
+            "api_base": base,
+        })
+
+
 class PublicMenuView(APIView):
     """The menu, for the customer app.
 
