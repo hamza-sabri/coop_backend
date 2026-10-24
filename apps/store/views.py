@@ -1509,6 +1509,69 @@ class PublicStatsView(APIView):
         return Response(payload)
 
 
+def _round_down(n: int) -> int:
+    """Two significant figures, rounded DOWN: 1,287 -> 1,200; 46 -> 46.
+
+    The marketing site says "1,200+", never "1,287": an exact, ticking number
+    is a business figure, a rounded one is a claim."""
+    n = int(n or 0)
+    if n < 100:
+        return n
+    step = 10 ** (len(str(n)) - 2)
+    return n // step * step
+
+
+class PublicSiteStatsView(APIView):
+    """GET /public/site-stats/ — the few numbers sijiliati.com shows.
+
+    Platform-wide, aggregate, rounded down, and OFF until SITE_STATS_ON is set
+    (the shop owner agrees to it first). No names, no money, no per-shop
+    figures, demo (seed_showcase) rows left out. Exempt from the StoreResolved
+    guard like PublicStatsView: no store is involved.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "price_check"
+
+    CACHE_KEY = "public:site-stats:v1"
+    TTL = 30 * 60
+
+    def get(self, request):
+        if not getattr(settings, "SITE_STATS_ON", False):
+            return Response({"on": False})
+        cached = cache.get(self.CACHE_KEY)
+        if cached is not None:
+            return Response(cached)
+
+        # unscoped() BY DESIGN: platform-wide totals, nothing per tenant.
+        demo = models.DemoMark.unguarded.filter(model="store.Sale").values("object_pk")
+        sales = models.Sale.objects.unscoped().filter(is_return=False).exclude(pk__in=demo)
+        cups = (
+            models.SaleItem.objects.unscoped()
+            .filter(sale__in=sales)
+            .aggregate(n=Sum("quantity"))["n"]
+            or 0
+        )
+        first = sales.order_by("created_at").values_list("created_at", flat=True).first()
+        payload = {
+            "on": True,
+            "shops": models.Store.objects.filter(is_active=True).count(),
+            "sales": _round_down(sales.count()),
+            "items": _round_down(int(cups)),
+            "members": _round_down(models.LoyaltyProfile.objects.unscoped().count()),
+            "orders": _round_down(
+                models.Order.objects.unscoped()
+                .filter(status=models.Order.Status.COLLECTED)
+                .count()
+            ),
+            "since": first.year if first else None,
+        }
+        cache.set(self.CACHE_KEY, payload, self.TTL)
+        return Response(payload)
+
+
 class PublicOrderingView(APIView):
     """GET /public/ordering/ — can customers order right now?
 
@@ -1828,6 +1891,18 @@ class ReportsBaseView(APIView):
         StoreResolved,  # tenant-API 400 guard
     ]
     required_module = "reports"
+
+    def dispatch(self, request, *args, **kwargs):
+        # ?pay=cash|card narrows every figure this request computes to sales
+        # paid that way (apps/store/finance.py · PAY). Always cleared after,
+        # so it can never leak into another request on this thread.
+        from apps.store import finance
+
+        token = finance.PAY.set(finance.pay_from(request.GET))
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        finally:
+            finance.PAY.reset(token)
 
     @property
     def store_id(self):

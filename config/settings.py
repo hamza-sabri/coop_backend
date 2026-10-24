@@ -543,6 +543,8 @@ APP_ANDROID_URL = os.getenv(
 APP_API_BASE = os.getenv("APP_API_BASE", "")
 # Hosts APP_API_BASE may point at (a typo here must never strand every phone).
 APP_API_HOSTS = [h.strip() for h in os.getenv("APP_API_HOSTS", "clinixa.cloud,sijiliati.com").split(",") if h.strip()]
+# sijiliati.com shows rounded platform totals only once the shop owner agrees.
+SITE_STATS_ON = env_bool("SITE_STATS_ON", False)
 APP_REVIEW_CODE = os.getenv("APP_REVIEW_CODE", "")
 
 # Web Push for the customer app (apps/store/webpush.py). One key pair for the

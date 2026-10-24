@@ -39,6 +39,7 @@ class StoreResolved(BasePermission):
     - /admin/*                   Django admin (cross-tenant ops)
     - /api/schema/, /api/docs/*  OpenAPI + docs; static files
     - /api/v1/public/stats/      platform-wide marketing aggregates
+    - /api/v1/public/site-stats/ sijiliati.com rounded totals (off by default)
     - /api/v1/pos/cart-state/    per-USER resource (scoped by account, not tenant)
     """
 

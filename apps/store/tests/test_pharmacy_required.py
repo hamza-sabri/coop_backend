@@ -203,6 +203,7 @@ class PharmacyRequiredContractTests(TestCase):
         self.assertEqual(r.status_code, 200)
         # central marketing stats: platform-wide by design
         self.assertEqual(self.anon.get("/api/v1/public/stats/").status_code, 200)
+        self.assertEqual(self.anon.get("/api/v1/public/site-stats/").status_code, 200)
         # POS cart state: per-USER resource, tenant-free by design
         r = self.WITHOUT.get("/api/v1/pos/cart-state/")
         self.assertEqual(r.status_code, 200)

@@ -35,7 +35,7 @@ def _lines(store_id, start: date, end: date, shift=None):
     lo, hi = finance.bounds(start, end)
     return finance._in_shift(
         models.SaleItem.objects.for_pharmacy(store_id).filter(
-            sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
+            finance.pay_q("sale__"), sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
         ),
         shift,
         field="sale__created_at",
@@ -71,7 +71,7 @@ def items_report(store_id, start: date, end: date, period="month") -> dict:
     )
     ps, pe = finance.previous_range(start, end, period)
     elapsed_end = min(end, finance.today())
-    if elapsed_end < end:
+    if elapsed_end < end and not finance.is_timed(start):
         pe = min(pe, ps + timedelta(days=(elapsed_end - start).days))
     prev = {
         r["product_id"]: r
@@ -81,7 +81,7 @@ def items_report(store_id, start: date, end: date, period="month") -> dict:
     returned = {
         r["sale_item__product_id"]: r
         for r in models.SaleReturn.objects.for_pharmacy(store_id)
-        .filter(created_at__gte=lo, created_at__lt=hi)
+        .filter(finance.pay_q("sale__"), created_at__gte=lo, created_at__lt=hi)
         .values("sale_item__product_id")
         .annotate(n=Coalesce(Sum("quantity"), Value(ZERO, output_field=DEC)), refunds=Sum("refund_amount"))
     }
@@ -214,7 +214,7 @@ def item_detail(store_id, product_id: int, start: date, end: date) -> dict | Non
     lo, hi = finance.bounds(start, end)
     rets = (
         models.SaleReturn.objects.for_pharmacy(store_id)
-        .filter(sale_item__product_id=p.pk, created_at__gte=lo, created_at__lt=hi)
+        .filter(finance.pay_q("sale__"), sale_item__product_id=p.pk, created_at__gte=lo, created_at__lt=hi)
         .values("reason")
         .annotate(n=Count("id"))
     )
@@ -265,7 +265,7 @@ def times_report(store_id, start: date, end: date) -> dict:
     lo, hi = finance.bounds(start, end)
     per_day = defaultdict(lambda: {"revenue": ZERO, "tickets": 0})
     for s in models.Sale.objects.for_pharmacy(store_id).filter(
-        created_at__gte=lo, created_at__lt=hi, is_return=False
+        finance.pay_q(), created_at__gte=lo, created_at__lt=hi, is_return=False
     ).values("created_at", "discounted_total"):
         d = finance.business_date(s["created_at"])
         per_day[d]["revenue"] += Decimal(s["discounted_total"] or 0)
@@ -273,11 +273,11 @@ def times_report(store_id, start: date, end: date) -> dict:
     # Money handed back comes off the day it was handed back — the same rule
     # as the profit statement, so a day here and a day there are one number.
     for r in models.SaleReturn.objects.for_pharmacy(store_id).filter(
-        created_at__gte=lo, created_at__lt=hi
+        finance.pay_q("sale__"), created_at__gte=lo, created_at__lt=hi
     ).values("created_at", "refund_amount"):
         per_day[finance.business_date(r["created_at"])]["revenue"] -= Decimal(r["refund_amount"] or 0)
     for s in models.Sale.objects.for_pharmacy(store_id).filter(
-        created_at__gte=lo, created_at__lt=hi, is_return=True
+        finance.pay_q(), created_at__gte=lo, created_at__lt=hi, is_return=True
     ).values("created_at", "discounted_total"):
         per_day[finance.business_date(s["created_at"])]["revenue"] -= Decimal(s["discounted_total"] or 0)
     # Average per weekday over the days that weekday actually occurred in the
@@ -343,7 +343,7 @@ def shifts_report(store_id, start: date, end: date) -> dict:
 def customers_report(store_id, start: date, end: date) -> dict:
     lo, hi = finance.bounds(start, end)
     sales = models.Sale.objects.for_pharmacy(store_id).filter(
-        created_at__gte=lo, created_at__lt=hi, is_return=False
+        finance.pay_q(), created_at__gte=lo, created_at__lt=hi, is_return=False
     )
     tickets = sales.count()
     named = sales.exclude(customer_id=None)
@@ -400,7 +400,9 @@ def customers_report(store_id, start: date, end: date) -> dict:
 # ── المرتجعات ─────────────────────────────────────────────────────────────
 def returns_report(store_id, start: date, end: date) -> dict:
     lo, hi = finance.bounds(start, end)
-    rets = models.SaleReturn.objects.for_pharmacy(store_id).filter(created_at__gte=lo, created_at__lt=hi)
+    rets = models.SaleReturn.objects.for_pharmacy(store_id).filter(
+        finance.pay_q("sale__"), created_at__gte=lo, created_at__lt=hi
+    )
     labels = dict(models.SaleReturn.Reason.choices)
     head = rets.aggregate(
         n=Count("id"),

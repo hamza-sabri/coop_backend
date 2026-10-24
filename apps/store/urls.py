@@ -47,6 +47,7 @@ urlpatterns = router.urls + [
         name="public-product-qr",
     ),
     path("public/stats/", views.PublicStatsView.as_view(), name="public-stats"),
+    path("public/site-stats/", views.PublicSiteStatsView.as_view(), name="public-site-stats"),
     # The customer app reads its menu here — see PublicMenuView.
     path("public/app-config/", views.PublicAppConfigView.as_view(), name="public-app-config"),
     path("public/menu/", views.PublicMenuView.as_view(), name="public-menu"),

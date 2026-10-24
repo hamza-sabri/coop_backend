@@ -32,6 +32,7 @@ Two rules that keep the numbers honest:
 from __future__ import annotations
 
 import calendar
+import contextvars
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -53,6 +54,51 @@ CENT = Decimal("0.01")
 #: Saturday. The week as it is lived here.
 WEEK_START = 5
 
+# ── which payments a report counts ─────────────────────────────────────────
+#: "cash" or "card" while a report request asked for one (?pay=), else None.
+#: Set and cleared around each reports request (ReportsBaseView), so every
+#: query below can narrow itself without threading a parameter through twenty
+#: functions. Delivery platforms (HAAT, Wheels) join this list when they exist.
+PAYMENTS = ("cash", "card")
+PAY: contextvars.ContextVar = contextvars.ContextVar("report_pay", default=None)
+
+
+def pay_from(params):
+    v = (params.get("pay") or "").strip().lower()
+    return v if v in PAYMENTS else None
+
+
+def pay_q(prefix: str = "") -> Q:
+    """Rows of sales paid the way the report asked (all of them by default)."""
+    p = PAY.get()
+    return Q(**{f"{prefix}payment_method": p}) if p else Q()
+
+
+def pay_filtered() -> bool:
+    return PAY.get() is not None
+
+
+# ── exact start and end times ──────────────────────────────────────────────
+class Day(date):
+    """A business date that may carry the exact moment a custom range starts
+    (`lo`) or ends (`hi`). bounds() uses them when present, so a report can be
+    asked for "Friday 18:00 → Saturday 02:00" while everything that walks the
+    range day by day keeps working on plain dates (arithmetic on a Day gives
+    a Day without the moments)."""
+
+    lo = None
+    hi = None
+
+
+def _day(d: date, *, lo=None, hi=None) -> Day:
+    x = Day(d.year, d.month, d.day)
+    x.lo, x.hi = lo, hi
+    return x
+
+
+def is_timed(start) -> bool:
+    return getattr(start, "lo", None) is not None
+
 
 def q2(x) -> Decimal:
     return Decimal(x or 0).quantize(CENT)
@@ -72,12 +118,28 @@ def today() -> date:
 
 
 def bounds(start: date, end: date):
-    """Aware [from, to) datetimes covering business days start..end."""
+    """Aware [from, to) datetimes covering business days start..end — or the
+    exact moments of a custom range (see Day)."""
     tz = timezone.get_current_timezone()
     h = _hour()
-    lo = timezone.make_aware(datetime.combine(start, time(hour=h)), tz)
-    hi = timezone.make_aware(datetime.combine(end + timedelta(days=1), time(hour=h)), tz)
+    lo = getattr(start, "lo", None) or timezone.make_aware(datetime.combine(start, time(hour=h)), tz)
+    hi = getattr(end, "hi", None) or timezone.make_aware(
+        datetime.combine(end + timedelta(days=1), time(hour=h)), tz
+    )
     return lo, hi
+
+
+def _moment(v):
+    """'2026-10-24T18:00' (or with a space) → an aware datetime; a bare date
+    or anything else → None."""
+    s = str(v or "").strip().replace(" ", "T")
+    if len(s) < 16 or s[10] != "T":
+        return None
+    try:
+        dt = datetime.fromisoformat(s[:16])
+    except ValueError:
+        return None
+    return timezone.make_aware(dt, timezone.get_current_timezone())
 
 
 def _parse(d):
@@ -103,6 +165,23 @@ def resolve_range(params) -> dict:
     elif period == "custom":
         start = _parse(params.get("start")) or anchor
         end = _parse(params.get("end")) or start
+        lo_at, hi_at = _moment(params.get("start")), _moment(params.get("end"))
+        if lo_at or hi_at:
+            # Exact times: from the start moment up to (not including) the
+            # end moment. A side given as a bare date keeps its business-day
+            # edge.
+            lo_at = lo_at or bounds(start, start)[0]
+            hi_at = hi_at or bounds(end, end)[1]
+            if hi_at < lo_at:
+                lo_at, hi_at = hi_at, lo_at
+            if hi_at - lo_at > timedelta(days=366):
+                lo_at = hi_at - timedelta(days=366)
+            start = _day(business_date(lo_at), lo=lo_at)
+            end = _day(business_date(max(lo_at, hi_at - timedelta(microseconds=1))), hi=hi_at)
+            return {
+                "start": start, "end": end, "period": period,
+                "start_at": lo_at.isoformat(), "end_at": hi_at.isoformat(),
+            }
         if end < start:
             start, end = end, start
         if (end - start).days > 366:
@@ -115,6 +194,14 @@ def resolve_range(params) -> dict:
 
 
 def previous_range(start: date, end: date, period: str):
+    if is_timed(start) and getattr(end, "hi", None):
+        # The same length of time, straight before.
+        span = end.hi - start.lo
+        lo, hi = start.lo - span, start.lo
+        return (
+            _day(business_date(lo), lo=lo),
+            _day(business_date(max(lo, hi - timedelta(microseconds=1))), hi=hi),
+        )
     if period == "month":
         prev_end = start - timedelta(days=1)
         return prev_end.replace(day=1), prev_end
@@ -215,7 +302,7 @@ def opex(store_id, start: date, end: date) -> dict:
 # ── the statement ───────────────────────────────────────────────────────────
 def _sales_block(store_id, lo, hi, shift):
     sales = _in_shift(
-        models.Sale.objects.for_pharmacy(store_id).filter(created_at__gte=lo, created_at__lt=hi),
+        models.Sale.objects.for_pharmacy(store_id).filter(pay_q(), created_at__gte=lo, created_at__lt=hi),
         shift,
     )
     normal = sales.filter(is_return=False)
@@ -231,7 +318,7 @@ def _sales_block(store_id, lo, hi, shift):
 
     items = _in_shift(
         models.SaleItem.objects.for_pharmacy(store_id).filter(
-            sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
+            pay_q("sale__"), sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
         ),
         shift,
         field="sale__created_at",
@@ -246,7 +333,7 @@ def _sales_block(store_id, lo, hi, shift):
     )
 
     returns = _in_shift(
-        models.SaleReturn.objects.for_pharmacy(store_id).filter(created_at__gte=lo, created_at__lt=hi),
+        models.SaleReturn.objects.for_pharmacy(store_id).filter(pay_q("sale__"), created_at__gte=lo, created_at__lt=hi),
         shift,
     ).aggregate(
         refunds=Coalesce(Sum("refund_amount"), Value(ZERO, output_field=DEC)),
@@ -282,6 +369,12 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
         shift,
     )
     waste = q2(waste_qs.aggregate(n=Coalesce(Sum("total_cost"), Value(ZERO, output_field=DEC)))["n"])
+    # Waste, count differences and expenses belong to the whole shop, not to
+    # one way of paying: a report narrowed to cash or card leaves them out
+    # (they show under «الكل»).
+    narrowed = pay_filtered()
+    if narrowed:
+        waste = ZERO
     # A remake is a second drink: its cost is on top of the first one's.
     remakes = q2(ret["remake_cost"])
     # Stock counts. Only for ingredients that are in a recipe: their use by
@@ -297,7 +390,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
         shift,
     )
     shrink = ZERO
-    for m in counts.values("quantity", "unit_cost"):
+    for m in ([] if narrowed else counts.values("quantity", "unit_cost")):
         shrink -= Decimal(m["quantity"]) * Decimal(m["unit_cost"])
     shrink = q2(shrink)
     gross_profit = q2(net_revenue - cogs - waste - remakes - shrink)
@@ -317,6 +410,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
             "day_start_hour": _hour(),
         },
         "shift": None,
+        "pay": PAY.get(),
         "lines": {
             "gross_sales": str(gross),
             "discounts": str(discounts),
@@ -362,7 +456,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
         out["lines"]["shift_wages"] = str(wages)
         out["lines"]["contribution"] = str(q2(gross_profit - wages))
     else:
-        ex = opex(store_id, start, elapsed_end) if days else {"rows": [], "total": ZERO}
+        ex = opex(store_id, start, elapsed_end) if (days and not narrowed) else {"rows": [], "total": q2(ZERO)}
         out["opex"] = ex["rows"]
         out["lines"]["opex"] = str(ex["total"])
         net_profit = q2(gross_profit - ex["total"])
@@ -394,7 +488,7 @@ def pnl(store_id, start: date, end: date, *, shift=None, period="custom",
 
     if with_compare:
         ps, pe = previous_range(start, end, period)
-        if elapsed_end < end and days:
+        if elapsed_end < end and days and not is_timed(start):
             # A period still running is compared like for like: the first 4
             # days of October against the first 4 days of September, not
             # against all of September.
@@ -420,8 +514,9 @@ def _series(store_id, start: date, end: date, shift) -> list:
     cost = defaultdict(Decimal)
     tickets = defaultdict(int)
 
+    narrowed = pay_filtered()
     sales = _in_shift(
-        models.Sale.objects.for_pharmacy(store_id).filter(created_at__gte=lo, created_at__lt=hi),
+        models.Sale.objects.for_pharmacy(store_id).filter(pay_q(), created_at__gte=lo, created_at__lt=hi),
         shift,
     )
     for s in sales.values("created_at", "discounted_total", "is_return"):
@@ -432,20 +527,20 @@ def _series(store_id, start: date, end: date, shift) -> list:
             rev[d] += Decimal(s["discounted_total"] or 0)
             tickets[d] += 1
     for r in _in_shift(
-        models.SaleReturn.objects.for_pharmacy(store_id).filter(created_at__gte=lo, created_at__lt=hi),
+        models.SaleReturn.objects.for_pharmacy(store_id).filter(pay_q("sale__"), created_at__gte=lo, created_at__lt=hi),
         shift,
     ).values("created_at", "refund_amount"):
         rev[business_date(r["created_at"])] -= Decimal(r["refund_amount"] or 0)
     items = _in_shift(
         models.SaleItem.objects.for_pharmacy(store_id).filter(
-            sale__created_at__gte=lo, sale__created_at__lt=hi,
+            pay_q("sale__"), sale__created_at__gte=lo, sale__created_at__lt=hi,
             sale__is_return=False, unit_cost__isnull=False,
         ),
         shift, field="sale__created_at",
     )
     for i in items.values("sale__created_at", "unit_cost", "quantity"):
         cost[business_date(i["sale__created_at"])] += Decimal(i["unit_cost"]) * Decimal(i["quantity"])
-    for w in _in_shift(
+    for w in [] if narrowed else _in_shift(
         models.StockMove.objects.for_pharmacy(store_id).filter(
             kind=models.StockMove.Kind.WASTE, created_at__gte=lo, created_at__lt=hi
         ),
@@ -455,12 +550,12 @@ def _series(store_id, start: date, end: date, shift) -> list:
     # Remakes and recipe-item count differences, the same as the statement.
     for r in _in_shift(
         models.SaleReturn.objects.for_pharmacy(store_id).filter(
-            created_at__gte=lo, created_at__lt=hi, refund_amount=0
+            pay_q("sale__"), created_at__gte=lo, created_at__lt=hi, refund_amount=0
         ),
         shift,
     ).values("created_at", "cost_written_off"):
         cost[business_date(r["created_at"])] += Decimal(r["cost_written_off"] or 0)
-    for c in _in_shift(
+    for c in [] if narrowed else _in_shift(
         models.StockMove.objects.for_pharmacy(store_id).filter(
             kind=models.StockMove.Kind.COUNT, created_at__gte=lo, created_at__lt=hi,
             item_id__in=models.RecipeLine.objects.for_pharmacy(store_id).values("item_id"),
@@ -483,6 +578,8 @@ def _series(store_id, start: date, end: date, shift) -> list:
         }
         if shift is None and d <= last:
             m = d.replace(day=1)
+            if narrowed:
+                month_cost[m] = ZERO  # expenses are the whole shop's
             if m not in month_cost:
                 last_day = m.replace(day=calendar.monthrange(m.year, m.month)[1])
                 month_cost[m] = opex(store_id, m, last_day)["total"] / Decimal(last_day.day)
@@ -505,7 +602,7 @@ def hourly_by_category(store_id, start: date, end: date, shift=None) -> dict:
     lo, hi = bounds(start, end)
     items = _in_shift(
         models.SaleItem.objects.for_pharmacy(store_id).filter(
-            sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
+            pay_q("sale__"), sale__created_at__gte=lo, sale__created_at__lt=hi, sale__is_return=False
         ),
         shift, field="sale__created_at",
     )
